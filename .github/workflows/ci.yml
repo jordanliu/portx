@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # windows optional; enable when Win daemon paths are solid
+        # os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: make build
+
+      - name: Smoke
+        shell: bash
+        run: |
+          ./bin/portx version
+          ./bin/portx help >/dev/null
+          ./bin/portx cloudflared install >/dev/null || true
+
+  formula-syntax:
+    name: Formula syntax
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Audit formula (syntax)
+        run: |
+          # ruby -c checks syntax without needing a published tarball
+          ruby -c Formula/portx.rb

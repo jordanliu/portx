@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Version metadata
+        id: meta
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          DATE: ${{ steps.meta.outputs.date }}
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w -X portx/internal/buildinfo.Version=${VERSION} -X portx/internal/buildinfo.Commit=${COMMIT} -X portx/internal/buildinfo.Date=${DATE}"
+
+          build() {
+            local goos=$1 goarch=$2 out=$3
+            echo "building $out"
+            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "$LDFLAGS" -o "dist/$out" ./cmd/portx
+          }
+
+          build darwin arm64  "portx_${VERSION}_darwin_arm64"
+          build darwin amd64  "portx_${VERSION}_darwin_amd64"
+          build linux  amd64  "portx_${VERSION}_linux_amd64"
+          build linux  arm64  "portx_${VERSION}_linux_arm64"
+          build windows amd64 "portx_${VERSION}_windows_amd64.exe"
+
+          # Source archive for Homebrew
+          git archive --format=tar.gz --prefix="portx-${VERSION}/" -o "dist/portx-${VERSION}.tar.gz" HEAD
+
+          cd dist
+          shasum -a 256 portx_* > SHA256SUMS
+          cat SHA256SUMS
+
+          # Print Homebrew formula fields for maintainers
+          {
+            echo "## Homebrew formula update"
+            echo ""
+            echo '```ruby'
+            echo "url \"https://github.com/${{ github.repository }}/archive/refs/tags/${{ steps.meta.outputs.tag }}.tar.gz\""
+            echo "sha256 \"$(shasum -a 256 "portx-${VERSION}.tar.gz" | awk '{print $1}')\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: PortX ${{ steps.meta.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/portx_*
+            dist/SHA256SUMS
+            dist/portx-*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Optional: verify formula builds on macOS after release (needs public tag/tarball)
+  # brew-install:
+  #   needs: release
+  #   runs-on: macos-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: brew install cloudflared
+  #     - run: brew install --build-from-source Formula/portx.rb

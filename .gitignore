@@ -1,0 +1,6 @@
+/bin/
+/dist/
+*.tmp
+.DS_Store
+portx.yaml
+.portx.yaml

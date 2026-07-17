@@ -13,18 +13,18 @@ Run `portx <command> --help` for the installed binary’s current help output.
 Expose one local HTTP origin. Without `--url`, PortX starts a quick tunnel. With
 `--url`, it starts a managed route under the configured profile.
 
-| Flag | Purpose |
-| --- | --- |
-| `--url` | Managed mode; empty value infers a hostname, a short value becomes a subdomain, and a full value is used as-is. |
-| `--save` | Save a managed route to `portx.yaml`. |
-| `--name` | Name used when saving the route. |
-| `--json` | Print status as JSON and keep the session open until terminated. |
-| `--replace` | Replace an existing active lease for the hostname. |
-| `--reuse` | Reuse an existing compatible route when possible. |
-| `--host-header` | Override the `Host` header sent to the local origin. |
-| `--scheme` | Use `http` or `https` for the local origin. |
-| `--no-origin-check` | Skip the local listening-service preflight check. |
-| `--insecure-skip-verify` | Allow an HTTPS origin with an invalid certificate. |
+| Flag                     | Purpose                                                                                                         |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `--url`                  | Managed mode; empty value infers a hostname, a short value becomes a subdomain, and a full value is used as-is. |
+| `--save`                 | Save a managed route to `portx.yaml`.                                                                           |
+| `--name`                 | Name used when saving the route.                                                                                |
+| `--json`                 | Print status as JSON and keep the session open until terminated.                                                |
+| `--replace`              | Replace an existing active lease for the hostname.                                                              |
+| `--reuse`                | Reuse an existing compatible route when possible.                                                               |
+| `--host-header`          | Override the `Host` header sent to the local origin.                                                            |
+| `--scheme`               | Use `http` or `https` for the local origin.                                                                     |
+| `--no-origin-check`      | Skip the local listening-service preflight check.                                                               |
+| `--insecure-skip-verify` | Allow an HTTPS origin with an invalid certificate.                                                              |
 
 ### `portx start`
 
@@ -55,21 +55,21 @@ the same without provisioning a tunnel or DNS record.
 
 ### Other commands
 
-| Command | Purpose |
-| --- | --- |
-| `portx list` | List active routes. |
-| `portx stop <hostname-or-id>` | Stop a route by hostname or lease ID prefix. |
-| `portx doctor [--verify]` | Check config, credentials, tunnel, DNS, daemon, origin, and optionally the public route. |
-| `portx config show` | Display resolved configuration paths and values. |
-| `portx config validate` | Validate global and project configuration. |
-| `portx cleanup [--force]` | Remove stale sockets, PID files, leases, and legacy runtime state. |
-| `portx reset [--yes]` | Delete PortX-owned Cloudflare resources and local profile data. |
-| `portx daemon status` | Show managed-daemon status. |
-| `portx daemon stop` | Stop the managed daemon. |
-| `portx cloudflared version` | Show the resolved `cloudflared` binary and version. |
-| `portx cloudflared install` | Show `cloudflared` installation guidance. |
-| `portx cloudflared update` | Show `cloudflared` upgrade guidance. |
-| `portx version` | Print version and build information. |
+| Command                       | Purpose                                                                                  |
+| ----------------------------- | ---------------------------------------------------------------------------------------- |
+| `portx list`                  | List active routes.                                                                      |
+| `portx stop <hostname-or-id>` | Stop a route by hostname or lease ID prefix.                                             |
+| `portx doctor [--verify]`     | Check config, credentials, tunnel, DNS, daemon, origin, and optionally the public route. |
+| `portx config show`           | Display resolved configuration paths and values.                                         |
+| `portx config validate`       | Validate global and project configuration.                                               |
+| `portx cleanup [--force]`     | Remove stale sockets, PID files, leases, and legacy runtime state.                       |
+| `portx reset [--yes]`         | Delete PortX-owned Cloudflare resources and local profile data.                          |
+| `portx daemon status`         | Show managed-daemon status.                                                              |
+| `portx daemon stop`           | Stop the managed daemon.                                                                 |
+| `portx cloudflared version`   | Show the resolved `cloudflared` binary and version.                                      |
+| `portx cloudflared install`   | Show `cloudflared` installation guidance.                                                |
+| `portx cloudflared update`    | Show `cloudflared` upgrade guidance.                                                     |
+| `portx version`               | Print version and build information.                                                     |
 
 Global options include `--profile`, `--log-level`, and the standard command
 help/version flags.
@@ -144,20 +144,6 @@ portx reset --keep-local
 Remote cleanup requires a working API credential. If remote cleanup cannot be
 completed, PortX retains local recovery data.
 
-For a clean local setup/login test:
-
-```bash
-make wipe
-make build
-./bin/portx login --force
-./bin/portx setup
-```
-
-The wipe removes PortX config/state, caches, browser credentials, supported OS
-credential-store entries, Go build/test caches, and generated binaries. It does
-not delete Cloudflare resources by default. Use `make wipe WIPE_REMOTE=1` for
-that, or pass multiple profiles with `PORTX_PROFILES="personal work"`.
-
 Do not delete the entire `~/.cloudflared` directory if you use unrelated
 Cloudflare tunnels. The wipe removes only PortX’s browser certificate and its
 timestamped backups.
@@ -200,18 +186,18 @@ portx doctor --verify
 portx --log-level debug http 3000
 ```
 
-| Problem | What to try |
-| --- | --- |
-| `cloudflared not found` | Install it with `brew install cloudflared`, then run `portx cloudflared version`. |
-| Browser login reports an invalid token | Run `portx login --force`, then `portx setup`. |
-| Setup says DNS propagation is pending | Wait briefly and run `portx doctor --verify`; new wildcard records may not be visible to every resolver immediately. |
-| Setup says stale or unverified daemon state | Run `portx doctor`, then `portx cleanup --force`. |
-| Origin connection errors | Confirm the app is listening on the target port, or use `--no-origin-check` when appropriate. |
-| Hostname is already active | Run `portx list`, then `portx stop <hostname>`, `--replace`, or `--reuse`. |
-| DNS record already points elsewhere | Resolve the record conflict in Cloudflare or choose another hostname. |
-| SSL errors on a multi-level hostname | Prefer `*.zone` over `*.sub.zone`, or configure the required certificate coverage. |
-| Tunnel was deleted in Cloudflare | Run `portx setup` again. |
-| Project routes are not found | Run from the project directory or pass `--file ./path/portx.yaml`. |
+| Problem                                     | What to try                                                                                                          |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `cloudflared not found`                     | Install it with `brew install cloudflared`, then run `portx cloudflared version`.                                    |
+| Browser login reports an invalid token      | Run `portx login --force`, then `portx setup`.                                                                       |
+| Setup says DNS propagation is pending       | Wait briefly and run `portx doctor --verify`; new wildcard records may not be visible to every resolver immediately. |
+| Setup says stale or unverified daemon state | Run `portx doctor`, then `portx cleanup --force`.                                                                    |
+| Origin connection errors                    | Confirm the app is listening on the target port, or use `--no-origin-check` when appropriate.                        |
+| Hostname is already active                  | Run `portx list`, then `portx stop <hostname>`, `--replace`, or `--reuse`.                                           |
+| DNS record already points elsewhere         | Resolve the record conflict in Cloudflare or choose another hostname.                                                |
+| SSL errors on a multi-level hostname        | Prefer `*.zone` over `*.sub.zone`, or configure the required certificate coverage.                                   |
+| Tunnel was deleted in Cloudflare            | Run `portx setup` again.                                                                                             |
+| Project routes are not found                | Run from the project directory or pass `--file ./path/portx.yaml`.                                                   |
 
 Setup saves provisioned resources before public verification. If DNS is still
 propagating, the profile may already be usable even though verification is

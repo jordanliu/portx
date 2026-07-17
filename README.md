@@ -124,7 +124,7 @@ portx http 5173 --url=web
 ```
 
 For profiles, multi-domain behavior, hostname conflicts, and certificate
-limitations, see the [detailed reference](docs/reference.md).
+limitations, see [Profiles and multiple domains](docs/reference.md#profiles-and-multiple-domains).
 
 ## Project routes
 
@@ -170,7 +170,7 @@ around it.
 | Route lifecycle        | Manage processes directly   | `list`, `stop`, `replace`, `reuse`             |
 | Diagnostics            | Cloudflare-focused          | Config, DNS, tunnel, daemon, and origin checks |
 
-Use `cloudflared` directly when you need full control over tunnel configuration.
+Use cloudflared directly when you need full control over tunnel configuration.
 Use PortX when you want stable development URLs without managing that
 configuration yourself.
 
@@ -189,7 +189,7 @@ configuration yourself.
 | `portx version`           | Print build information                             |
 
 Run `portx <command> --help` for flags. The complete command reference is in
-the [detailed reference](docs/reference.md).
+[Commands and flags](docs/reference.md#commands-and-flags).
 
 ## Security
 
@@ -205,7 +205,11 @@ disables TLS verification only between PortX and an HTTPS origin. Read the full
 
 ## Additional documentation
 
-- [Reference](docs/reference.md)
+- [Commands and flags](docs/reference.md#commands-and-flags)
+- [Profiles and multiple domains](docs/reference.md#profiles-and-multiple-domains)
+- [Reset, cleanup, and clean setup tests](docs/reference.md#reset-cleanup-and-clean-setup-tests)
+- [Security and limitations](docs/reference.md#security-and-limitations)
+- [Troubleshooting](docs/reference.md#troubleshooting)
 
 ## License
 

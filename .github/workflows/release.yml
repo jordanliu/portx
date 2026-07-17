@@ -378,7 +378,9 @@ jobs:
           for attempt in 1 2 3 4 5; do
             pr_count="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json number --jq 'length')"
             [[ "$pr_count" == "1" ]] && break
-            sleep 2
+            if [[ "$attempt" != "5" ]]; then
+              sleep 2
+            fi
           done
 
           if [[ "$pr_count" != "1" ]]; then
@@ -402,9 +404,9 @@ jobs:
           {
             echo "## Homebrew tap automation"
             echo ""
-            printf 'Repository: `%s`\n' "$TAP_REPOSITORY"
-            printf 'Release: `%s`\n' "${{ needs.release.outputs.tag }}"
-            printf 'Tap status: `%s`\n' "${{ steps.tap.outputs.tap_status }}"
+            printf 'Repository: %s\n' "$TAP_REPOSITORY"
+            printf 'Release: %s\n' "${{ needs.release.outputs.tag }}"
+            printf 'Tap status: %s\n' "${{ steps.tap.outputs.tap_status }}"
             if [[ -n "${{ steps.tap.outputs.pr_url }}" ]]; then
               echo "Tap PR: ${{ steps.tap.outputs.pr_url }}"
             fi

@@ -1,5 +1,7 @@
 /bin/
 /dist/
+portx
+portx.exe
 *.tmp
 .DS_Store
 portx.yaml

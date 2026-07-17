@@ -49,6 +49,15 @@ brew install portx
 brew install cloudflared
 ```
 
+Or run the installer script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jordanliu/portx/main/scripts/install.sh | bash
+```
+
+The script taps `jordanliu/portx` and installs PortX with its `cloudflared`
+dependency. It requires [Homebrew](https://brew.sh).
+
 PortX uses the [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/) binary on your `PATH`. It does not download or embed it.
 
 Build from source with Go 1.26.5 or later:

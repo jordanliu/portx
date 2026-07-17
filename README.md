@@ -40,9 +40,16 @@ portx http 3000 --url=api
 ### Homebrew
 
 ```bash
+brew install jordanliu/portx/portx
+```
+
+This installs `cloudflared` as a dependency. If you prefer the short formula
+name, explicitly trust the formula after tapping the repository:
+
+```bash
 brew tap jordanliu/portx
+brew trust --formula jordanliu/portx/portx
 brew install portx
-brew install cloudflared
 ```
 
 Or use the installer script:

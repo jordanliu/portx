@@ -11,8 +11,11 @@ import (
 )
 
 func Preflight(ctx context.Context, target *url.URL) error {
+	if err := ValidateTargetSafety(target); err != nil {
+		return err
+	}
 	host := target.Host
-	if _, _, err := net.SplitHostPort(host); err != nil {
+	if target.Port() == "" {
 		port := "80"
 		if target.Scheme == "https" {
 			port = "443"
@@ -20,8 +23,9 @@ func Preflight(ctx context.Context, target *url.URL) error {
 		host = net.JoinHostPort(target.Hostname(), port)
 	}
 
-	d := net.Dialer{Timeout: 3 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", host)
+	dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	conn, err := SafeDialContext(dialCtx, "tcp", host)
 	if err != nil {
 		return apperr.Wrap(apperr.ExitOrigin, fmt.Sprintf(
 			"Could not connect to %q.\n\nStart the local service or pass --no-origin-check",

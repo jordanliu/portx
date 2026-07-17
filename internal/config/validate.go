@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
 
 	"portx/internal/apperr"
@@ -22,7 +23,13 @@ func (c Config) Validate() error {
 	if err := validateBindAddress(c.Defaults.BindAddress); err != nil {
 		return err
 	}
-	for name, p := range c.Profiles {
+	names := make([]string, 0, len(c.Profiles))
+	for name := range c.Profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		p := c.Profiles[name]
 		if err := p.Validate(name); err != nil {
 			return err
 		}
@@ -65,6 +72,10 @@ func (p Profile) Validate(name string) error {
 	}
 	if !strings.HasPrefix(p.Wildcard, "*.") {
 		return apperr.New(apperr.ExitInvalidArgs, fmt.Sprintf("profile %q: wildcard must start with *.", name))
+	}
+	base := strings.TrimSuffix(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(p.Wildcard)), "*."), ".")
+	if base == "" || strings.ContainsAny(base, " /\\\r\n\x00") {
+		return apperr.New(apperr.ExitInvalidArgs, fmt.Sprintf("profile %q: wildcard has an invalid domain", name))
 	}
 	return nil
 }

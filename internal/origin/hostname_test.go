@@ -64,3 +64,66 @@ func TestValidateHostname(t *testing.T) {
 		t.Fatal("expected apex reject")
 	}
 }
+
+func TestParsePublicURLRejectsPortInShortForm(t *testing.T) {
+	if _, err := ParsePublicURL("api:8080", "*.example.dev"); err == nil {
+		t.Fatal("expected short-form hostname with a port to be rejected")
+	}
+}
+
+func TestParsePublicURLRejectsUnsafeComponents(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{
+		"https://user@example.dev",
+		"https://api.example.dev:443",
+		"https://api.example.dev/?token=secret",
+		"https://api.example.dev/#fragment",
+		"ftp://api.example.dev",
+		"api.example.dev/../admin",
+	} {
+		if _, err := ParsePublicURL(raw, "*.example.dev"); err == nil {
+			t.Errorf("ParsePublicURL(%q) succeeded; want error", raw)
+		}
+	}
+}
+
+func TestValidateHostHeader(t *testing.T) {
+	t.Parallel()
+	for _, host := range []string{
+		"localhost",
+		"localhost:3000",
+		"origin.internal",
+		"127.0.0.1:8080",
+		"[::1]:8080",
+	} {
+		if err := ValidateHostHeader(host); err != nil {
+			t.Errorf("ValidateHostHeader(%q): %v", host, err)
+		}
+	}
+	for _, host := range []string{
+		"evil.example/route",
+		"evil.example\r\nX-Injected: true",
+		"-bad.example",
+		"[::1",
+		"example.com:0",
+		"2001:db8::1",
+	} {
+		if err := ValidateHostHeader(host); err == nil {
+			t.Errorf("ValidateHostHeader(%q) succeeded; want error", host)
+		}
+	}
+}
+
+func TestValidatePathPrefix(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"", "/", "/webhooks", "/api/v1"} {
+		if err := ValidatePathPrefix(path); err != nil {
+			t.Errorf("ValidatePathPrefix(%q): %v", path, err)
+		}
+	}
+	for _, path := range []string{"webhooks", "/../admin", "/api\\v1", "/api?token=secret", "/api\x00"} {
+		if err := ValidatePathPrefix(path); err == nil {
+			t.Errorf("ValidatePathPrefix(%q) succeeded; want error", path)
+		}
+	}
+}

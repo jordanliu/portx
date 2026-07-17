@@ -1,14 +1,17 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
 	"portx/internal/apperr"
+	"portx/internal/origin"
 )
 
 const ProjectFileName = "portx.yaml"
@@ -68,7 +71,9 @@ func LoadProject(path string) (ProjectConfig, error) {
 	if err != nil {
 		return pc, err
 	}
-	if err := yaml.Unmarshal(data, &pc); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&pc); err != nil {
 		return pc, apperr.Wrap(apperr.ExitInvalidArgs, "parse project config", err)
 	}
 	if pc.Version == 0 {
@@ -102,11 +107,7 @@ func SaveProject(path string, pc ProjectConfig) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeFileAtomic(path, data, 0o600)
 }
 
 func (p ProjectConfig) Validate() error {
@@ -116,15 +117,34 @@ func (p ProjectConfig) Validate() error {
 	if len(p.Routes) == 0 {
 		return apperr.New(apperr.ExitInvalidArgs, "project config has no routes")
 	}
-	for name, r := range p.Routes {
+	names := make([]string, 0, len(p.Routes))
+	for name := range p.Routes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		r := p.Routes[name]
 		if strings.TrimSpace(name) == "" {
 			return apperr.New(apperr.ExitInvalidArgs, "route name is required")
 		}
 		if strings.TrimSpace(r.Target) == "" {
 			return apperr.New(apperr.ExitInvalidArgs, fmt.Sprintf("route %q: target is required", name))
 		}
+		target, err := origin.Normalize(r.Target)
+		if err != nil {
+			return apperr.Wrap(apperr.ExitInvalidArgs, fmt.Sprintf("route %q: invalid target", name), err)
+		}
 		if strings.TrimSpace(r.Hostname) == "" {
 			return apperr.New(apperr.ExitInvalidArgs, fmt.Sprintf("route %q: hostname is required", name))
+		}
+		if strings.ContainsAny(r.Hostname+r.HostHeader, "\r\n\x00") {
+			return apperr.New(apperr.ExitInvalidArgs, fmt.Sprintf("route %q: hostname or host header contains invalid characters", name))
+		}
+		if r.Path != "" && !strings.HasPrefix(r.Path, "/") {
+			return apperr.New(apperr.ExitInvalidArgs, fmt.Sprintf("route %q: path must start with /", name))
+		}
+		if target.User != nil {
+			return apperr.New(apperr.ExitInvalidArgs, fmt.Sprintf("route %q: target URLs must not include username or password", name))
 		}
 	}
 	return nil
@@ -138,9 +158,9 @@ func (p *ProjectConfig) UpsertRoute(name string, route ProjectRoute) {
 }
 
 type MergedView struct {
-	Global  Config        `json:"global" yaml:"global"`
+	Global  Config         `json:"global" yaml:"global"`
 	Project *ProjectConfig `json:"project,omitempty" yaml:"project,omitempty"`
-	Profile string        `json:"active_profile" yaml:"active_profile"`
+	Profile string         `json:"active_profile" yaml:"active_profile"`
 }
 
 func MergeView(global Config, project *ProjectConfig, profile string) MergedView {

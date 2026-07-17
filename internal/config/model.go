@@ -3,10 +3,10 @@ package config
 import "time"
 
 type Config struct {
-	Version        int                 `yaml:"version" json:"version"`
-	DefaultProfile string              `yaml:"default_profile" json:"default_profile"`
-	Defaults       Defaults            `yaml:"defaults" json:"defaults"`
-	Profiles       map[string]Profile  `yaml:"profiles" json:"profiles"`
+	Version        int                `yaml:"version" json:"version"`
+	DefaultProfile string             `yaml:"default_profile" json:"default_profile"`
+	Defaults       Defaults           `yaml:"defaults" json:"defaults"`
+	Profiles       map[string]Profile `yaml:"profiles" json:"profiles"`
 }
 
 type Defaults struct {

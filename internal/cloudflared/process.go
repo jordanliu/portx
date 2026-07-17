@@ -2,28 +2,28 @@ package cloudflared
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"portx/internal/apperr"
-	"portx/internal/logredact"
 	"portx/internal/procutil"
 )
 
 var (
 	trycloudflareRe = regexp.MustCompile(`https://[a-zA-Z0-9-]+\.trycloudflare\.com`)
+	metricsAddrRe   = regexp.MustCompile(`(?i)(?:starting metrics server on\s+|addr[=:]"?)(127\.0\.0\.1:\d+)`)
 	// cloudflared / API failure phrases when tunnel is gone or token invalid
 	fatalLogRe = regexp.MustCompile(`(?i)(unauthorized|unauthorised|invalid token|tunnel.*(not found|deleted|disabled)|failed to (authenticate|register)|registration error|connection refused.*edge|403 forbidden|401 unauthorized)`)
 )
@@ -32,14 +32,23 @@ type Process struct {
 	cmd        *exec.Cmd
 	bin        string
 	metricsURL string
+	startTime  int64
 	logPath    string
 	mu         sync.Mutex
 	stdoutBuf  strings.Builder
+	logMu      sync.Mutex
+	logFile    *os.File
+	logClose   sync.Once
+	outputErr  error
 	quickURL   string
 	exited     atomic.Bool
 	exitErr    error
 	done       chan struct{}
 }
+
+const maxMetricsResponseBytes = 64 << 10
+
+var metricsClient = &http.Client{Timeout: 2 * time.Second}
 
 type QuickOptions struct {
 	OriginURL   string
@@ -53,35 +62,13 @@ type NamedOptions struct {
 	MetricsAddr string
 }
 
-func freeLoopbackPort() (int, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port, nil
-}
-
 func StartQuick(ctx context.Context, bin string, opts QuickOptions) (*Process, error) {
-	metricsAddr := opts.MetricsAddr
-	if metricsAddr == "" {
-		port, err := freeLoopbackPort()
-		if err != nil {
-			return nil, err
-		}
-		metricsAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	}
-	args := []string{
-		"tunnel",
-		"--no-autoupdate",
-		"--metrics", metricsAddr,
-		"--url", opts.OriginURL,
-	}
+	args := quickArgs(opts.OriginURL, opts.MetricsAddr)
 	return start(ctx, startConfig{
 		Bin:         bin,
 		Args:        args,
 		LogPath:     opts.LogPath,
-		MetricsAddr: metricsAddr,
+		MetricsAddr: opts.MetricsAddr,
 	})
 }
 
@@ -89,27 +76,39 @@ func StartNamed(ctx context.Context, bin string, opts NamedOptions) (*Process, e
 	if opts.Token == "" {
 		return nil, apperr.New(apperr.ExitAuth, "tunnel token is empty")
 	}
-	metricsAddr := opts.MetricsAddr
-	if metricsAddr == "" {
-		port, err := freeLoopbackPort()
-		if err != nil {
-			return nil, err
-		}
-		metricsAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	}
-	args := []string{
-		"tunnel",
-		"--no-autoupdate",
-		"--metrics", metricsAddr,
-		"run",
-	}
+	args := namedArgs(opts.MetricsAddr)
 	return start(ctx, startConfig{
 		Bin:         bin,
 		Args:        args,
 		Env:         append(os.Environ(), "TUNNEL_TOKEN="+opts.Token),
 		LogPath:     opts.LogPath,
-		MetricsAddr: metricsAddr,
+		MetricsAddr: opts.MetricsAddr,
 	})
+}
+
+func quickArgs(originURL, metricsAddr string) []string {
+	return []string{
+		"tunnel",
+		"--no-autoupdate",
+		"--metrics", metricsArgument(metricsAddr),
+		"--url", originURL,
+	}
+}
+
+func namedArgs(metricsAddr string) []string {
+	return []string{
+		"tunnel",
+		"--no-autoupdate",
+		"--metrics", metricsArgument(metricsAddr),
+		"run",
+	}
+}
+
+func metricsArgument(metricsAddr string) string {
+	if metricsAddr == "" {
+		return "127.0.0.1:0"
+	}
+	return metricsAddr
 }
 
 type startConfig struct {
@@ -125,34 +124,41 @@ func start(ctx context.Context, cfg startConfig) (*Process, error) {
 	if cfg.Env != nil {
 		cmd.Env = cfg.Env
 	}
-	stdout, err := cmd.StdoutPipe()
+	logFile, err := openLogFile(cfg.LogPath)
 	if err != nil {
-		return nil, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
+		return nil, apperr.Wrap(apperr.ExitCloudflared, "open cloudflared log", err)
 	}
 	p := &Process{
-		cmd:        cmd,
-		bin:        cfg.Bin,
-		metricsURL: "http://" + cfg.MetricsAddr,
-		logPath:    cfg.LogPath,
-		done:       make(chan struct{}),
+		cmd:     cmd,
+		bin:     cfg.Bin,
+		logPath: cfg.LogPath,
+		done:    make(chan struct{}),
+		logFile: logFile,
 	}
-	var logFile *os.File
-	if cfg.LogPath != "" {
-		if err := os.MkdirAll(filepath.Dir(cfg.LogPath), 0o700); err == nil {
-			logFile, _ = os.OpenFile(cfg.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		}
+	if cfg.MetricsAddr != "" {
+		p.metricsURL = "http://" + cfg.MetricsAddr
 	}
-	go p.consume(stdout, logFile)
-	go p.consume(stderr, logFile)
+	stdout := &processWriter{process: p}
+	stderr := &processWriter{process: p}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
+		p.closeLog()
 		return nil, apperr.Wrap(apperr.ExitCloudflared, "start cloudflared", err)
 	}
+	startTime, err := procutil.StartTime(cmd.Process.Pid)
+	if err != nil {
+		_ = procutil.Kill(cmd.Process.Pid)
+		_ = cmd.Wait()
+		p.closeLog()
+		return nil, fmt.Errorf("record cloudflared process identity: %w", err)
+	}
+	p.startTime = startTime
 	go func() {
 		err := cmd.Wait()
+		stdout.Flush()
+		stderr.Flush()
+		p.closeLog()
 		p.mu.Lock()
 		p.exitErr = err
 		p.exited.Store(true)
@@ -162,24 +168,152 @@ func start(ctx context.Context, cfg startConfig) (*Process, error) {
 	return p, nil
 }
 
-func (p *Process) consume(r io.Reader, logFile *os.File) {
+func (p *Process) consume(r io.Reader) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
-		line := sc.Text()
-		p.mu.Lock()
-		p.stdoutBuf.WriteString(line)
-		p.stdoutBuf.WriteByte('\n')
-		if p.quickURL == "" {
-			if m := trycloudflareRe.FindString(line); m != "" {
-				p.quickURL = m
-			}
-		}
-		p.mu.Unlock()
-		if logFile != nil {
-			_, _ = logFile.WriteString(line + "\n")
+		p.consumeLine(sc.Text())
+	}
+	if err := sc.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
+		p.recordOutputError(fmt.Errorf("read cloudflared output: %w", err))
+	}
+}
+
+func (p *Process) consumeLine(line string) {
+	p.mu.Lock()
+	p.stdoutBuf.WriteString(line)
+	p.stdoutBuf.WriteByte('\n')
+	if p.stdoutBuf.Len() > 64*1024 {
+		s := p.stdoutBuf.String()
+		p.stdoutBuf.Reset()
+		p.stdoutBuf.WriteString(s[len(s)-64*1024:])
+	}
+	if p.quickURL == "" {
+		if m := trycloudflareRe.FindString(line); m != "" {
+			p.quickURL = m
 		}
 	}
+	if p.metricsURL == "" {
+		if match := metricsAddrRe.FindStringSubmatch(line); len(match) == 2 {
+			p.metricsURL = "http://" + match[1]
+		}
+	}
+	p.mu.Unlock()
+	p.writeLog(line)
+}
+
+type processWriter struct {
+	process *Process
+	mu      sync.Mutex
+	buffer  bytes.Buffer
+}
+
+func (w *processWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	_, _ = w.buffer.Write(data)
+	for {
+		line, err := w.buffer.ReadString('\n')
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return 0, err
+			}
+			w.buffer.WriteString(line)
+			break
+		}
+		w.process.consumeLine(strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"))
+	}
+	return len(data), nil
+}
+
+func (w *processWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.buffer.Len() == 0 {
+		return
+	}
+	w.process.consumeLine(strings.TrimSuffix(strings.TrimSuffix(w.buffer.String(), "\n"), "\r"))
+	w.buffer.Reset()
+}
+
+func openLogFile(path string) (*os.File, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, err
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("log path is not a regular file: %q", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func (p *Process) writeLog(line string) {
+	p.logMu.Lock()
+	defer p.logMu.Unlock()
+	if p.logFile == nil {
+		return
+	}
+	if _, err := p.logFile.WriteString(line + "\n"); err != nil {
+		p.recordOutputErrorLocked(fmt.Errorf("write cloudflared log: %w", err))
+		_ = p.logFile.Close()
+		p.logFile = nil
+	}
+}
+
+func (p *Process) recordOutputError(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.outputErr == nil {
+		p.outputErr = err
+	}
+}
+
+func (p *Process) recordOutputErrorLocked(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.outputErr == nil {
+		p.outputErr = err
+	}
+}
+
+func (p *Process) outputError() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.outputErr
+}
+
+func (p *Process) closeLog() {
+	p.logClose.Do(func() {
+		p.logMu.Lock()
+		defer p.logMu.Unlock()
+		if p.logFile != nil {
+			if err := p.logFile.Close(); err != nil {
+				p.recordOutputErrorLocked(fmt.Errorf("close cloudflared log: %w", err))
+			}
+			p.logFile = nil
+		}
+	})
 }
 
 func (p *Process) PID() int {
@@ -206,7 +340,7 @@ func (p *Process) LogTail(max int) string {
 	if max > 0 && len(s) > max {
 		s = s[len(s)-max:]
 	}
-	return logredact.String(strings.TrimSpace(s))
+	return strings.TrimSpace(s)
 }
 
 func (p *Process) fatalFromLogs() string {
@@ -251,16 +385,30 @@ func (p *Process) QuickURL() string {
 }
 
 func (p *Process) fetchQuickTunnel(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.metricsURL+"/quicktunnel", nil)
+	p.mu.Lock()
+	metricsURL := p.metricsURL
+	p.mu.Unlock()
+	if metricsURL == "" {
+		return "", errors.New("metrics endpoint is not ready")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metricsURL+"/quicktunnel", nil)
 	if err != nil {
 		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := metricsClient.Do(req)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, bodyErr := readMetricsBody(resp)
+	if resp.StatusCode != http.StatusOK {
+		if bodyErr != nil {
+			return "", errors.Join(fmt.Errorf("quick tunnel endpoint returned %s", resp.Status), bodyErr)
+		}
+		return "", fmt.Errorf("quick tunnel endpoint returned %s", resp.Status)
+	}
+	if bodyErr != nil {
+		return "", bodyErr
+	}
 	s := string(body)
 	if i := strings.Index(s, `"hostname":"`); i >= 0 {
 		rest := s[i+len(`"hostname":"`):]
@@ -304,40 +452,122 @@ func (p *Process) WaitReady(ctx context.Context) error {
 }
 
 func (p *Process) Ready(ctx context.Context) error {
+	p.mu.Lock()
+	metricsURL := p.metricsURL
+	p.mu.Unlock()
+	if metricsURL == "" {
+		return errors.New("metrics endpoint is not ready")
+	}
 	// Short request timeout so WaitReady loop stays responsive
 	cctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodGet, p.metricsURL+"/ready", nil)
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, metricsURL+"/ready", nil)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := metricsClient.Do(req)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	_, bodyErr := readMetricsBody(resp)
 	if resp.StatusCode != http.StatusOK {
+		if bodyErr != nil {
+			return errors.Join(fmt.Errorf("not ready: %s", resp.Status), bodyErr)
+		}
 		return fmt.Errorf("not ready: %s", resp.Status)
+	}
+	if bodyErr != nil {
+		return bodyErr
 	}
 	return nil
 }
 
+func readMetricsBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, errors.New("metrics response has no body")
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxMetricsResponseBytes+1))
+	closeErr := resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read metrics response: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close metrics response: %w", closeErr)
+	}
+	if len(body) > maxMetricsResponseBytes {
+		return nil, fmt.Errorf("metrics response exceeds %d bytes", maxMetricsResponseBytes)
+	}
+	return body, nil
+}
+
 func (p *Process) Stop(timeout time.Duration) error {
 	if p.cmd.Process == nil {
-		return nil
+		return p.outputError()
 	}
 	if p.exited.Load() {
-		return nil
+		return p.waitForExit()
 	}
 	pid := p.cmd.Process.Pid
-	_ = procutil.Interrupt(pid)
+	if err := p.verifyIdentity(pid); err != nil {
+		return errors.Join(err, p.waitForExit())
+	}
+	interruptErr := procutil.Interrupt(pid)
+	if interruptErr != nil && !procutil.Alive(pid) {
+		return p.waitForExit()
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-p.done:
+		return p.outputError()
+	case <-timer.C:
+		if err := p.verifyIdentity(pid); err != nil {
+			return errors.Join(err, p.waitForExit())
+		}
+		if err := procutil.Kill(pid); err != nil && procutil.Alive(pid) {
+			return fmt.Errorf("stop cloudflared: %w", err)
+		}
+	}
+
+	killTimer := time.NewTimer(2 * time.Second)
+	defer killTimer.Stop()
+	select {
+	case <-p.done:
+		return p.outputError()
+	case <-killTimer.C:
+		return fmt.Errorf("cloudflared process %d did not exit after kill", pid)
+	}
+}
+
+func (p *Process) verifyIdentity(pid int) error {
+	if !procutil.Alive(pid) {
 		return nil
-	case <-time.After(timeout):
-		_ = procutil.Kill(pid)
-		<-p.done
-		return nil
+	}
+	startTime, err := procutil.StartTime(pid)
+	if err != nil {
+		select {
+		case <-p.done:
+			return nil
+		default:
+		}
+		if !procutil.Alive(pid) {
+			return nil
+		}
+		return fmt.Errorf("verify cloudflared process identity: %w", err)
+	}
+	if startTime != p.startTime {
+		return fmt.Errorf("cloudflared PID %d no longer belongs to the started process", pid)
+	}
+	return nil
+}
+
+func (p *Process) waitForExit() error {
+	select {
+	case <-p.done:
+		return p.outputError()
+	case <-time.After(2 * time.Second):
+		return fmt.Errorf("cloudflared process did not exit")
 	}
 }
 

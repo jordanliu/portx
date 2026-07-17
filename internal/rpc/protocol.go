@@ -8,6 +8,7 @@ type Request struct {
 	Version int            `json:"version"`
 	Method  string         `json:"method"`
 	Params  map[string]any `json:"params,omitempty"`
+	Auth    string         `json:"auth,omitempty"`
 }
 
 type Response struct {
@@ -26,29 +27,31 @@ type StatusResult struct {
 }
 
 type AcquireParams struct {
-	Hostname   string `json:"hostname"`
-	PathPrefix string `json:"path_prefix"`
-	Target     string `json:"target"`
-	HostHeader string `json:"host_header"`
-	OwnerPID   int    `json:"owner_pid"`
-	Reuse      bool   `json:"reuse"`
-	Replace    bool   `json:"replace"`
-	Insecure   bool   `json:"insecure"`
+	Hostname       string `json:"hostname"`
+	PathPrefix     string `json:"path_prefix"`
+	Target         string `json:"target"`
+	HostHeader     string `json:"host_header"`
+	OwnerPID       int    `json:"owner_pid"`
+	OwnerStartTime int64  `json:"owner_start_time,omitempty"`
+	Reuse          bool   `json:"reuse"`
+	Replace        bool   `json:"replace"`
+	Insecure       bool   `json:"insecure"`
 }
 
 func leaseToMap(l leases.Lease) map[string]any {
 	return map[string]any{
-		"id":          l.ID,
-		"route_id":    l.RouteID,
-		"hostname":    l.Hostname,
-		"path_prefix": l.PathPrefix,
-		"target":      l.Target,
-		"host_header": l.HostHeader,
-		"owner_pid":   l.OwnerPID,
-		"created_at":  l.CreatedAt,
-		"renewed_at":  l.RenewedAt,
-		"expires_at":  l.ExpiresAt,
-		"ephemeral":   l.Ephemeral,
+		"id":               l.ID,
+		"route_id":         l.RouteID,
+		"hostname":         l.Hostname,
+		"path_prefix":      l.PathPrefix,
+		"target":           l.Target,
+		"host_header":      l.HostHeader,
+		"owner_pid":        l.OwnerPID,
+		"owner_start_time": l.OwnerStartTime,
+		"created_at":       l.CreatedAt,
+		"renewed_at":       l.RenewedAt,
+		"expires_at":       l.ExpiresAt,
+		"ephemeral":        l.Ephemeral,
 	}
 }
 

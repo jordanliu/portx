@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -173,9 +174,9 @@ func selectFallback(title string, choices []Choice) (int, Choice, error) {
 	if line == "" {
 		return 0, choices[0], nil
 	}
-	var n int
-	if _, err := fmt.Sscanf(line, "%d", &n); err != nil || n < 1 || n > len(choices) {
-		return 0, choices[0], nil
+	n, err := strconv.Atoi(line)
+	if err != nil || n < 1 || n > len(choices) {
+		return -1, Choice{}, fmt.Errorf("invalid choice %q: enter a number from 1 to %d", line, len(choices))
 	}
 	return n - 1, choices[n-1], nil
 }

@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/urfave/cli/v3"
 
 	"portx/internal/config"
+	"portx/internal/leases"
 	"portx/internal/rpc"
 	"portx/internal/ui"
 )
@@ -37,15 +40,39 @@ func listCommand() *cli.Command {
 				return nil
 			}
 			ui.Title("Active leases")
-			for _, l := range list {
-				id := l.ID
-				if len(id) > 8 {
-					id = id[:8]
-				}
-				ui.KeyValue(id, fmt.Sprintf("%s  →  %s  pid=%d  exp=%s",
-					l.Hostname, l.Target, l.OwnerPID, l.ExpiresAt.Format(time.RFC3339)))
+			for _, l := range sortedLeases(list) {
+				ui.KeyValue(shortLeaseID(l.ID), fmt.Sprintf("%s  →  %s  pid=%d  exp=%s",
+					leaseSelector(l), l.Target, l.OwnerPID, l.ExpiresAt.Format(time.RFC3339)))
 			}
 			return nil
 		},
 	}
+}
+
+func shortLeaseID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+func leaseSelector(l leases.Lease) string {
+	path := l.PathPrefix
+	if path == "" {
+		path = "/"
+	}
+	return strings.TrimSuffix(l.Hostname, ".") + path
+}
+
+func sortedLeases(list []leases.Lease) []leases.Lease {
+	sorted := append([]leases.Lease{}, list...)
+	sort.Slice(sorted, func(i, j int) bool {
+		left := leaseSelector(sorted[i])
+		right := leaseSelector(sorted[j])
+		if left != right {
+			return left < right
+		}
+		return sorted[i].ID < sorted[j].ID
+	})
+	return sorted
 }

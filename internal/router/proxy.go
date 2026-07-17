@@ -6,11 +6,29 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+
+	"portx/internal/httpx"
+	"portx/internal/origin"
 )
+
+const (
+	upstreamResponseHeaderTimeout = 30 * time.Second
+)
+
+var forwardingHeaders = []string{
+	"Forwarded",
+	"X-Forwarded-For",
+	"X-Forwarded-Host",
+	"X-Forwarded-Port",
+	"X-Forwarded-Proto",
+	"X-Real-IP",
+	"CF-Connecting-IP",
+}
 
 type Proxy struct {
 	registry  *Registry
@@ -22,17 +40,14 @@ func NewProxy(reg *Registry) *Proxy {
 		registry: reg,
 		transport: &http.Transport{
 			// Never route origin traffic through HTTP_PROXY (local dev tool).
-			Proxy: nil,
-			DialContext: (&net.Dialer{
-				Timeout:   5 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
+			Proxy:                 nil,
+			DialContext:           origin.SafeDialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   5 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
-			ResponseHeaderTimeout: 0,
+			ResponseHeaderTimeout: upstreamResponseHeaderTimeout,
 		},
 	}
 }
@@ -55,7 +70,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqID := uuid.NewString()
-	rp := httputil.NewSingleHostReverseProxy(route.Target)
+	rp := &httputil.ReverseProxy{}
 	tr := p.transport.Clone()
 	if route.Target.Scheme == "https" {
 		tr.TLSClientConfig = &tls.Config{
@@ -65,36 +80,120 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	rp.Transport = tr
 	rp.FlushInterval = 100 * time.Millisecond
-	origDirector := rp.Director
-	rp.Director = func(req *http.Request) {
-		origDirector(req)
-		req.Host = route.Target.Host
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+			return nil
+		}
+		resp.Body = httpx.NewIdleTimeoutBody(
+			resp.Body,
+			httpx.ResponseBodyIdleLimit,
+		)
+		return nil
+	}
+	rp.Rewrite = func(proxyReq *httputil.ProxyRequest) {
+		proxyReq.SetURL(route.Target)
+		proxyReq.Out.Host = route.Target.Host
 		if route.HostHeader != "" {
-			req.Host = route.HostHeader
+			proxyReq.Out.Host = route.HostHeader
 		}
-		// Strip spoofable inbound forwarding headers; set our own.
-		req.Header.Del("X-Forwarded-For")
-		req.Header.Del("X-Forwarded-Host")
-		req.Header.Del("X-Forwarded-Proto")
-		req.Header.Del("Forwarded")
-		// Prefer Cloudflare client IP when present (edge → cloudflared → us).
-		clientIP := r.Header.Get("CF-Connecting-IP")
-		if clientIP == "" {
-			clientIP, _, _ = net.SplitHostPort(r.RemoteAddr)
-			if clientIP == "" {
-				clientIP = r.RemoteAddr
-			}
-		}
-		req.Header.Set("X-Forwarded-For", clientIP)
-		req.Header.Set("X-Forwarded-Host", host)
-		req.Header.Set("X-Forwarded-Proto", "https") // public managed routes are always HTTPS at edge
-		req.Header.Set("X-PortX-Request-ID", reqID)
-		req.Header.Set("Forwarded", "for="+clientIP+";host="+host+";proto=https")
+		stripForwardingHeaders(proxyReq.Out.Header)
+		clientIP := requestClientIP(proxyReq.In)
+		proxyReq.Out.Header.Set("X-Forwarded-For", clientIP)
+		proxyReq.Out.Header.Set("X-Forwarded-Host", host)
+		proxyReq.Out.Header.Set("X-Forwarded-Proto", "https")
+		proxyReq.Out.Header.Set("X-PortX-Request-ID", reqID)
+		proxyReq.Out.Header.Set(
+			"Forwarded",
+			"for="+formatForwardedFor(clientIP)+";host="+host+";proto=https",
+		)
 	}
 	rp.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		http.Error(rw, "bad gateway", http.StatusBadGateway)
 	}
+	if r.Body != nil && r.Body != http.NoBody {
+		r.Body = httpx.NewIdleTimeoutBody(r.Body, httpx.RequestBodyIdleLimit)
+		defer r.Body.Close()
+	}
 	rp.ServeHTTP(w, r)
+}
+
+func stripForwardingHeaders(header http.Header) {
+	for _, name := range forwardingHeaders {
+		header.Del(name)
+	}
+}
+
+func requestClientIP(r *http.Request) string {
+	peerIP := normalizeIP(remoteIP(r.RemoteAddr))
+	cfIP := validPublicClientIP(r.Header.Get("CF-Connecting-IP"))
+	if cfIP != "" && isLoopbackIP(peerIP) {
+		return cfIP
+	}
+	if peerIP != "" {
+		return peerIP
+	}
+	return "unknown"
+}
+
+func remoteIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		return host
+	}
+	return strings.TrimSpace(remoteAddr)
+}
+
+func isLoopbackIP(raw string) bool {
+	addr, err := netip.ParseAddr(strings.Trim(raw, "[]"))
+	return err == nil && addr.IsLoopback()
+}
+
+func normalizeIP(raw string) string {
+	addr, err := netip.ParseAddr(strings.Trim(raw, "[]"))
+	if err != nil {
+		return ""
+	}
+	return addr.String()
+}
+
+func validPublicClientIP(raw string) string {
+	raw = strings.TrimSpace(raw)
+	addr, err := netip.ParseAddr(raw)
+	if err != nil || !addr.IsGlobalUnicast() {
+		return ""
+	}
+	if addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() {
+		return ""
+	}
+	if isClientIPSpecialUse(addr) {
+		return ""
+	}
+	return addr.String()
+}
+
+func isClientIPSpecialUse(addr netip.Addr) bool {
+	specialUsePrefixes := []netip.Prefix{
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+	}
+	for _, prefix := range specialUsePrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func formatForwardedFor(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err == nil && addr.Is6() {
+		return "[" + addr.String() + "]"
+	}
+	return ip
 }
 
 func normalizeHost(host string) string {
@@ -110,10 +209,7 @@ func ListenAndServe(addr string, handler http.Handler) (*http.Server, net.Listen
 	if err != nil {
 		return nil, nil, err
 	}
-	srv := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 30 * time.Second,
-	}
+	srv := httpx.NewServer(handler)
 	go func() { _ = srv.Serve(ln) }()
 	return srv, ln, nil
 }

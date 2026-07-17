@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -17,9 +18,9 @@ type Store struct {
 }
 
 type Data struct {
-	Version  int                      `json:"version"`
-	Phase    string                   `json:"phase,omitempty"`
-	Profiles map[string]ProfileState  `json:"profiles"`
+	Version  int                     `json:"version"`
+	Phase    string                  `json:"phase,omitempty"`
+	Profiles map[string]ProfileState `json:"profiles"`
 }
 
 type ProfileState struct {
@@ -34,15 +35,15 @@ type DNSRecord struct {
 }
 
 const (
-	PhaseNone            = "none"
-	PhaseAuthenticated   = "authenticated"
-	PhaseSelected        = "resources_selected"
-	PhaseTunnelEnsured   = "tunnel_ensured"
-	PhaseTokenStored     = "token_stored"
-	PhaseConfigApplied   = "config_applied"
-	PhaseDNSEnsured      = "dns_ensured"
-	PhaseVerified        = "verified"
-	PhaseReady           = "ready"
+	PhaseNone          = "none"
+	PhaseAuthenticated = "authenticated"
+	PhaseSelected      = "resources_selected"
+	PhaseTunnelEnsured = "tunnel_ensured"
+	PhaseTokenStored   = "token_stored"
+	PhaseConfigApplied = "config_applied"
+	PhaseDNSEnsured    = "dns_ensured"
+	PhaseVerified      = "verified"
+	PhaseReady         = "ready"
 )
 
 func Open() (*Store, error) {
@@ -113,9 +114,43 @@ func (s *Store) persist() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	return writeFileAtomic(s.path, b)
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to replace symlink: %q", path)
+		}
+	} else if !os.IsNotExist(err) {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	return nil
 }

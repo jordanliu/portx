@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"portx/internal/apperr"
@@ -75,6 +78,47 @@ func defaultCertPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".cloudflared", "cert.pem"), nil
+}
+
+// RemoveBrowserCredentials removes only the Cloudflare login certificate and
+// backups created by BrowserLogin. It refuses to traverse a symlinked config
+// directory and never removes unrelated cloudflared files.
+func RemoveBrowserCredentials() error {
+	certPath, err := defaultCertPath()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(certPath)
+	info, err := os.Lstat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("refusing to clean a symlinked cloudflared directory")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var removeErr error
+	for _, entry := range entries {
+		name := entry.Name()
+		certName := filepath.Base(certPath)
+		if name != certName && !strings.HasPrefix(name, certName+".bak.") {
+			continue
+		}
+		if entry.IsDir() {
+			removeErr = errors.Join(removeErr, fmt.Errorf("%s is a directory", name))
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			removeErr = errors.Join(removeErr, fmt.Errorf("remove %s: %w", name, err))
+		}
+	}
+	return removeErr
 }
 
 func decodeOriginCert(blocks []byte) (LoginResult, error) {

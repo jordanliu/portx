@@ -2,11 +2,11 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -36,8 +36,12 @@ func setupCommand() *cli.Command {
 	}
 }
 
-func runSetup(ctx context.Context, cmd *cli.Command) error {
-	cfg0, _ := config.Load()
+func runSetup(ctx context.Context, cmd *cli.Command) (err error) {
+	cfg0, err := config.Load()
+	if err != nil {
+		return err
+	}
+	originalCfg := cloneConfig(cfg0)
 	profileName := config.ResolveProfile(cmd.String("profile"), "", cfg0.DefaultProfile)
 	token, preferAccount, preferZone, err := authenticateSetup(ctx, cmd)
 	if err != nil {
@@ -48,19 +52,49 @@ func runSetup(ctx context.Context, cmd *cli.Command) error {
 	if err := cf.VerifyToken(ctx); err != nil {
 		return err
 	}
+	if err := coordinateRuntime(false); err != nil {
+		return fmt.Errorf("stop active PortX routes before setup: %w", err)
+	}
 
 	store, err := credentials.Open()
 	if err != nil {
-		return err
-	}
-	if err := store.Set(credentials.APITokenKey(profileName), token); err != nil {
 		return err
 	}
 	st, err := state.Open()
 	if err != nil {
 		return err
 	}
-	_ = st.SetPhase(state.PhaseAuthenticated)
+	originalState := st.Data()
+	previousState := originalState.Profiles[profileName]
+	apiToken, err := snapshotCredential(store, credentials.APITokenKey(profileName))
+	if err != nil {
+		return err
+	}
+	tunnelToken, err := snapshotCredential(store, credentials.TunnelTokenKey(profileName))
+	if err != nil {
+		return err
+	}
+	rollback := &setupRollback{
+		cf:            cf,
+		store:         store,
+		stateStore:    st,
+		originalCfg:   originalCfg,
+		originalState: originalState,
+		profileName:   profileName,
+		apiToken:      apiToken,
+		tunnelToken:   tunnelToken,
+	}
+	defer func() {
+		if err != nil && !rollback.keepResources {
+			rollback.run()
+		}
+	}()
+	if err := store.Set(credentials.APITokenKey(profileName), token); err != nil {
+		return err
+	}
+	if err := st.SetPhase(state.PhaseAuthenticated); err != nil {
+		return fmt.Errorf("save setup state: %w", err)
+	}
 
 	accounts, err := cf.ListAccounts(ctx)
 	if err != nil {
@@ -73,6 +107,7 @@ func runSetup(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	rollback.accountID = account.ID
 
 	zones, err := cf.ListZones(ctx, account.ID)
 	if err != nil {
@@ -85,6 +120,7 @@ func runSetup(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	rollback.zoneID = zone.ID
 	if zone.Status != "active" {
 		return apperr.New(apperr.ExitProvision, "zone is not active")
 	}
@@ -102,7 +138,9 @@ func runSetup(ctx context.Context, cmd *cli.Command) error {
 		return apperr.New(apperr.ExitInvalidArgs, "namespace must look like *.example.dev")
 	}
 	nsBase := strings.TrimPrefix(ns, "*.")
-	if !strings.HasSuffix(nsBase, zone.Name) && nsBase != zone.Name {
+	zoneName := strings.TrimSuffix(strings.ToLower(zone.Name), ".")
+	nsBaseLower := strings.TrimSuffix(strings.ToLower(nsBase), ".")
+	if nsBaseLower != zoneName && !strings.HasSuffix(nsBaseLower, "."+zoneName) {
 		return apperr.New(apperr.ExitInvalidArgs, "namespace must be inside the selected zone")
 	}
 	// Cloudflare Universal SSL covers apex + *.zone only (one label).
@@ -121,16 +159,14 @@ func runSetup(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 	ui.KeyValue("Namespace", ns)
-	_ = st.SetPhase(state.PhaseSelected)
-
-	status := ui.StartStatus("Ensuring Cloudflare tunnel")
-	cfg, err := config.Load()
-	if err != nil {
-		status.Fail(err)
-		return err
+	if err := st.SetPhase(state.PhaseSelected); err != nil {
+		return fmt.Errorf("save setup state: %w", err)
 	}
 
-	tunnel, tunnelToken, err := ensureTunnel(ctx, ensureTunnelOpts{
+	status := ui.StartStatus("Ensuring Cloudflare tunnel")
+	cfg := cloneConfig(originalCfg)
+
+	tunnel, tunnelTokenValue, created, previousConfig, err := ensureTunnel(ctx, ensureTunnelOpts{
 		cf:          cf,
 		store:       store,
 		status:      status,
@@ -138,14 +174,26 @@ func runSetup(ctx context.Context, cmd *cli.Command) error {
 		profileName: profileName,
 		accountID:   account.ID,
 	})
+	rollback.tunnelCreated = created
+	rollback.createdTunnelID = tunnel.ID
+	if !created {
+		rollback.reusedTunnelID = tunnel.ID
+		rollback.previousConfig = previousConfig
+	}
 	if err != nil {
 		return err
 	}
-	_ = st.SetPhase(state.PhaseTunnelEnsured)
-	_ = st.SetPhase(state.PhaseTokenStored)
-	_ = st.SetPhase(state.PhaseConfigApplied)
+	if err := st.SetPhase(state.PhaseTunnelEnsured); err != nil {
+		return fmt.Errorf("save setup state: %w", err)
+	}
+	if err := st.SetPhase(state.PhaseTokenStored); err != nil {
+		return fmt.Errorf("save setup state: %w", err)
+	}
+	if err := st.SetPhase(state.PhaseConfigApplied); err != nil {
+		return fmt.Errorf("save setup state: %w", err)
+	}
 
-	dnsID, owned, err := ensureWildcardDNS(ctx, ensureDNSOpts{
+	dnsID, owned, created, err := ensureWildcardDNS(ctx, ensureDNSOpts{
 		cf:     cf,
 		status: status,
 		zoneID: zone.ID,
@@ -155,37 +203,149 @@ func runSetup(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	_ = st.SetPhase(state.PhaseDNSEnsured)
-	_ = st.PutProfile(profileName, state.ProfileState{
+	rollback.dnsCreated = created
+	rollback.createdDNSID = dnsID
+	if err := st.SetPhase(state.PhaseDNSEnsured); err != nil {
+		return fmt.Errorf("save setup state: %w", err)
+	}
+	status.Set("Saving local config")
+	if err := saveSetupProfile(cfg, profileName, account, zone, ns, tunnel); err != nil {
+		status.Fail(err)
+		return err
+	}
+	if err := st.PutProfile(profileName, state.ProfileState{
 		TunnelID: tunnel.ID,
 		WildcardDNS: &state.DNSRecord{
 			RecordID:     dnsID,
 			Hostname:     ns,
 			OwnedByPortx: owned,
 		},
-	})
-
-	status.Set("Saving local config")
-	if err := saveSetupProfile(cfg, profileName, account, zone, ns, tunnel); err != nil {
-		status.Fail(err)
-		return err
+	}); err != nil {
+		return fmt.Errorf("save setup state: %w", err)
 	}
-
 	status.Set("Verifying end-to-end")
-	if err := verifySetup(ctx, cfg, tunnelToken, ns); err != nil {
+	if err := verifySetup(ctx, cfg, tunnelTokenValue, ns); err != nil {
 		status.Stop()
-		ui.Warn("End-to-end check failed: %v", err)
-		ui.Dim("   Resources are provisioned; try after DNS propagates:")
+		rollback.keepResources = true
+		ui.Warn("setup verification is pending: %v", err)
+		ui.Dim("   Resources are provisioned, but setup is not verified yet:")
 		ui.Dim("   portx doctor")
 		ui.Dim("   portx http --url=test.%s 3000", strings.TrimPrefix(ns, "*."))
+		return apperr.Wrap(
+			apperr.ExitProvision,
+			"setup provisioned resources but end-to-end verification failed",
+			err,
+		)
 	} else {
 		status.Stop()
-		_ = st.SetPhase(state.PhaseVerified)
-		_ = st.SetPhase(state.PhaseReady)
+		if err := st.SetPhase(state.PhaseVerified); err != nil {
+			return fmt.Errorf("save setup state: %w", err)
+		}
+		if err := st.SetPhase(state.PhaseReady); err != nil {
+			return fmt.Errorf("save setup state: %w", err)
+		}
+		if previousState.WildcardDNS != nil &&
+			previousState.WildcardDNS.OwnedByPortx &&
+			previousState.WildcardDNS.RecordID != "" &&
+			previousState.WildcardDNS.RecordID != dnsID {
+			if err := cf.DeleteDNS(ctx, zone.ID, previousState.WildcardDNS.RecordID); err != nil {
+				return fmt.Errorf("remove previous PortX-managed DNS record: %w", err)
+			}
+			ui.Success("removed previous wildcard DNS")
+		}
 	}
 
 	ui.PrintSetupReady(ns, tunnel.Name)
 	return nil
+}
+
+type credentialSnapshot struct {
+	value   string
+	present bool
+}
+
+type setupRollback struct {
+	cf              *cloudflare.Client
+	store           credentials.Store
+	stateStore      *state.Store
+	originalCfg     config.Config
+	originalState   state.Data
+	profileName     string
+	apiToken        credentialSnapshot
+	tunnelToken     credentialSnapshot
+	accountID       string
+	zoneID          string
+	createdTunnelID string
+	createdDNSID    string
+	tunnelCreated   bool
+	dnsCreated      bool
+	keepResources   bool
+	reusedTunnelID  string
+	previousConfig  map[string]any
+}
+
+func (r *setupRollback) run() {
+	if r.reusedTunnelID != "" && r.previousConfig != nil && r.accountID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := r.cf.PutTunnelConfigValue(ctx, r.accountID, r.reusedTunnelID, r.previousConfig); err != nil {
+			ui.Warn("setup rollback could not restore tunnel configuration: %v", err)
+		}
+		cancel()
+	}
+	if r.dnsCreated && r.createdDNSID != "" && r.zoneID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := r.cf.DeleteDNS(ctx, r.zoneID, r.createdDNSID); err != nil {
+			ui.Warn("setup rollback could not delete DNS record %s: %v", r.createdDNSID, err)
+		}
+		cancel()
+	}
+	if r.tunnelCreated && r.createdTunnelID != "" && r.accountID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := r.cf.DeleteTunnel(ctx, r.accountID, r.createdTunnelID); err != nil {
+			ui.Warn("setup rollback could not delete tunnel %s: %v", r.createdTunnelID, err)
+		}
+		cancel()
+	}
+	if err := restoreCredential(r.store, credentials.APITokenKey(r.profileName), r.apiToken); err != nil {
+		ui.Warn("setup rollback could not restore API token: %v", err)
+	}
+	if err := restoreCredential(r.store, credentials.TunnelTokenKey(r.profileName), r.tunnelToken); err != nil {
+		ui.Warn("setup rollback could not restore tunnel token: %v", err)
+	}
+	if err := r.stateStore.Replace(r.originalState); err != nil {
+		ui.Warn("setup rollback could not restore local state: %v", err)
+	}
+	if err := config.Save(r.originalCfg); err != nil {
+		ui.Warn("setup rollback could not restore local config: %v", err)
+	}
+}
+
+func snapshotCredential(store credentials.Store, key string) (credentialSnapshot, error) {
+	value, err := store.Get(key)
+	if err == nil {
+		return credentialSnapshot{value: value, present: true}, nil
+	}
+	var codeErr *apperr.CodeError
+	if errors.As(err, &codeErr) && codeErr.Code == apperr.ExitAuth {
+		return credentialSnapshot{}, nil
+	}
+	return credentialSnapshot{}, fmt.Errorf("read credential %q: %w", key, err)
+}
+
+func restoreCredential(store credentials.Store, key string, snapshot credentialSnapshot) error {
+	if snapshot.present {
+		return store.Set(key, snapshot.value)
+	}
+	return store.Delete(key)
+}
+
+func cloneConfig(cfg config.Config) config.Config {
+	profiles := make(map[string]config.Profile, len(cfg.Profiles))
+	for name, profile := range cfg.Profiles {
+		profiles[name] = profile
+	}
+	cfg.Profiles = profiles
+	return cfg
 }
 
 type ensureTunnelOpts struct {
@@ -197,23 +357,34 @@ type ensureTunnelOpts struct {
 	accountID   string
 }
 
-func ensureTunnel(ctx context.Context, o ensureTunnelOpts) (cloudflare.Tunnel, string, error) {
-	u, _ := user.Current()
-	username := "user"
-	if u != nil && u.Username != "" {
-		username = sanitize(u.Username)
-	}
+func ensureTunnel(
+	ctx context.Context,
+	o ensureTunnelOpts,
+) (cloudflare.Tunnel, string, bool, map[string]any, error) {
 	host, _ := os.Hostname()
 	host = sanitize(host)
-	tunnelName := fmt.Sprintf("portx-%s-%s", username, host)
+	profile := sanitize(o.profileName)
+	tunnelName := fmt.Sprintf("portx-%s-%s", profile, host)
 
 	existing := o.cfg.Profiles[o.profileName]
 	var tunnel cloudflare.Tunnel
+	created := false
 	var err error
 
 	if existing.TunnelID != "" {
 		tunnel, err = o.cf.GetTunnel(ctx, o.accountID, existing.TunnelID)
 		if err != nil {
+			if !cloudflare.IsNotFound(err) {
+				o.status.Fail(err)
+				return cloudflare.Tunnel{}, "", false, nil, fmt.Errorf(
+					"look up configured tunnel %q: %w",
+					existing.TunnelID,
+					err,
+				)
+			}
+			existing.TunnelID = ""
+		}
+		if err == nil && !tunnelReusable(tunnel) {
 			existing.TunnelID = ""
 		}
 	}
@@ -222,11 +393,11 @@ func ensureTunnel(ctx context.Context, o ensureTunnelOpts) (cloudflare.Tunnel, s
 		list, err := o.cf.ListTunnels(ctx, o.accountID, tunnelName)
 		if err != nil {
 			o.status.Fail(err)
-			return cloudflare.Tunnel{}, "", err
+			return cloudflare.Tunnel{}, "", false, nil, err
 		}
 		reused := false
 		for _, t := range list {
-			if t.Name != tunnelName {
+			if t.Name != tunnelName || !tunnelReusable(t) {
 				continue
 			}
 			meta, _ := t.Metadata["owned_by"].(string)
@@ -238,15 +409,58 @@ func ensureTunnel(ctx context.Context, o ensureTunnelOpts) (cloudflare.Tunnel, s
 		}
 		if !reused {
 			o.status.Set("Creating tunnel " + tunnelName)
+			creationID := uuid.NewString()
 			tunnel, err = o.cf.CreateTunnel(ctx, o.accountID, tunnelName, map[string]any{
-				"owned_by": "portx",
-				"machine":  host,
-				"version":  1,
+				"owned_by":    "portx",
+				"creation_id": creationID,
+				"machine":     host,
+				"version":     1,
 			})
-			if err != nil {
-				o.status.Fail(err)
-				return cloudflare.Tunnel{}, "", err
+			if err == nil && tunnel.ID != "" {
+				created = true
+			} else {
+				reconciled, reconcileErr := findOwnedTunnel(
+					ctx,
+					o.cf,
+					o.accountID,
+					tunnelName,
+					creationID,
+				)
+				if reconcileErr == nil && reconciled.ID != "" {
+					tunnel = reconciled
+					created = true
+				} else if err == nil {
+					o.status.Fail(fmt.Errorf("cloudflare returned an empty tunnel ID"))
+					if reconcileErr != nil {
+						return cloudflare.Tunnel{}, "", false, nil, fmt.Errorf(
+							"create tunnel returned no ID; reconcile ambiguous result: %v",
+							reconcileErr,
+						)
+					}
+					return cloudflare.Tunnel{}, "", false, nil, fmt.Errorf(
+						"create tunnel returned no ID",
+					)
+				} else {
+					o.status.Fail(err)
+					if reconcileErr != nil {
+						return cloudflare.Tunnel{}, "", false, nil, fmt.Errorf(
+							"create tunnel: %w; reconcile ambiguous result: %v",
+							err,
+							reconcileErr,
+						)
+					}
+					return cloudflare.Tunnel{}, "", false, nil, err
+				}
 			}
+		}
+	}
+	var previousConfig map[string]any
+	if !created {
+		o.status.Set("Saving existing tunnel configuration")
+		previousConfig, err = o.cf.GetTunnelConfig(ctx, o.accountID, tunnel.ID)
+		if err != nil {
+			o.status.Fail(err)
+			return tunnel, "", false, nil, err
 		}
 	}
 
@@ -254,12 +468,12 @@ func ensureTunnel(ctx context.Context, o ensureTunnelOpts) (cloudflare.Tunnel, s
 	tunnelToken, err := o.cf.GetTunnelToken(ctx, o.accountID, tunnel.ID)
 	if err != nil {
 		o.status.Fail(err)
-		return cloudflare.Tunnel{}, "", err
+		return tunnel, "", created, previousConfig, err
 	}
 	o.status.Set("Storing credentials (" + o.store.Backend() + ")")
 	if err := o.store.Set(credentials.TunnelTokenKey(o.profileName), tunnelToken); err != nil {
 		o.status.Fail(err)
-		return cloudflare.Tunnel{}, "", err
+		return tunnel, "", created, previousConfig, err
 	}
 
 	proxyPort := o.cfg.Defaults.ProxyPort
@@ -268,11 +482,88 @@ func ensureTunnel(ctx context.Context, o ensureTunnelOpts) (cloudflare.Tunnel, s
 	}
 	originURL := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
 	o.status.Set("Configuring tunnel origin")
-	if err := o.cf.PutTunnelConfig(ctx, o.accountID, tunnel.ID, originURL); err != nil {
+	if err := putTunnelConfigWithRetry(ctx, o.cf, o.accountID, tunnel.ID, originURL); err != nil {
 		o.status.Fail(err)
-		return cloudflare.Tunnel{}, "", err
+		return tunnel, "", created, previousConfig, err
 	}
-	return tunnel, tunnelToken, nil
+	return tunnel, tunnelToken, created, previousConfig, nil
+}
+
+func findOwnedTunnel(
+	ctx context.Context,
+	cf *cloudflare.Client,
+	accountID string,
+	name string,
+	creationID string,
+) (cloudflare.Tunnel, error) {
+	tunnels, err := cf.ListTunnels(ctx, accountID, name)
+	if err != nil {
+		return cloudflare.Tunnel{}, err
+	}
+	for _, tunnel := range tunnels {
+		if tunnel.Name != name || !tunnelReusable(tunnel) {
+			continue
+		}
+		ownedBy, _ := tunnel.Metadata["owned_by"].(string)
+		if ownedBy != "portx" {
+			continue
+		}
+		if creationID != "" {
+			metadataID, _ := tunnel.Metadata["creation_id"].(string)
+			if metadataID != creationID {
+				continue
+			}
+		}
+		return tunnel, nil
+	}
+	return cloudflare.Tunnel{}, fmt.Errorf("created tunnel was not found")
+}
+
+func putTunnelConfigWithRetry(ctx context.Context, cf *cloudflare.Client, accountID, tunnelID, originURL string) error {
+	const attempts = 4
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := cf.PutTunnelConfig(ctx, accountID, tunnelID, originURL); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if !strings.Contains(strings.ToLower(err.Error()), "tunnel not found") {
+				return err
+			}
+		}
+		if attempt == attempts-1 {
+			break
+		}
+		delay := time.Duration(1<<attempt) * time.Second
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return fmt.Errorf(
+		"configure tunnel %s: %w (Cloudflare may still be propagating the tunnel; retry setup if this persists)",
+		tunnelID,
+		lastErr,
+	)
+}
+
+func tunnelReusable(tunnel cloudflare.Tunnel) bool {
+	if tunnel.ID == "" {
+		return false
+	}
+	if tunnel.DeletedAt != nil && strings.TrimSpace(*tunnel.DeletedAt) != "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(tunnel.Status)) {
+	case "deleted", "deleting":
+		return false
+	default:
+		// Cloudflare reports a stopped but startable tunnel as inactive.
+		return true
+	}
 }
 
 type ensureDNSOpts struct {
@@ -283,14 +574,15 @@ type ensureDNSOpts struct {
 	tunnel cloudflare.Tunnel
 }
 
-func ensureWildcardDNS(ctx context.Context, o ensureDNSOpts) (dnsID string, owned bool, err error) {
+func ensureWildcardDNS(ctx context.Context, o ensureDNSOpts) (dnsID string, owned bool, created bool, err error) {
 	dnsName := strings.TrimPrefix(o.ns, "*.")
 	cnameTarget := o.tunnel.ID + ".cfargotunnel.com"
+	creationMarker := "portx-managed-" + uuid.NewString()
 	o.status.Set("Configuring DNS " + o.ns)
 	records, err := o.cf.ListDNS(ctx, o.zoneID, o.ns, "CNAME")
 	if err != nil {
 		o.status.Fail(err)
-		return "", false, apperr.Wrap(apperr.ExitProvision, "list DNS for wildcard", err)
+		return "", false, false, apperr.Wrap(apperr.ExitProvision, "list DNS for wildcard", err)
 	}
 	wantNames := map[string]bool{
 		o.ns:           true,
@@ -302,11 +594,13 @@ func ensureWildcardDNS(ctx context.Context, o ensureDNSOpts) (dnsID string, owne
 			continue
 		}
 		if r.Content == cnameTarget || r.Content == o.tunnel.ID+".cfargotunnel.com" {
-			return r.ID, true, nil
+			owned := strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Comment)), "portx-managed")
+			return r.ID, owned, false, nil
 		}
 		o.status.Fail(fmt.Errorf("DNS conflict on %q", r.Name))
-		return "", false, apperr.New(apperr.ExitProvision, fmt.Sprintf(
-			"DNS record %q already exists pointing to %q\n\nPortX will not replace it automatically. Remove or rename it, then re-run setup.",
+		return "", false, false, apperr.New(apperr.ExitProvision, fmt.Sprintf(
+			"DNS record %q already exists pointing to %q\n\n"+
+				"PortX will not replace it automatically. Remove or rename it, then re-run setup.",
 			r.Name, r.Content))
 	}
 
@@ -316,13 +610,68 @@ func ensureWildcardDNS(ctx context.Context, o ensureDNSOpts) (dnsID string, owne
 		Name:    o.ns,
 		Content: cnameTarget,
 		Proxied: true,
-		Comment: "portx-managed",
+		Comment: creationMarker,
 	})
-	if err != nil {
-		o.status.Fail(err)
-		return "", false, err
+	if err != nil || rec.ID == "" {
+		reconciled, reconcileErr := findMatchingDNS(
+			ctx,
+			o.cf,
+			o.zoneID,
+			o.ns,
+			cnameTarget,
+			creationMarker,
+		)
+		if reconcileErr == nil && reconciled.ID != "" {
+			rec = reconciled
+		} else if err == nil {
+			o.status.Fail(fmt.Errorf("cloudflare returned an empty DNS record ID"))
+			if reconcileErr != nil {
+				return "", false, false, fmt.Errorf(
+					"create DNS record returned no ID; reconcile ambiguous result: %v",
+					reconcileErr,
+				)
+			}
+			return "", false, false, fmt.Errorf("create DNS record returned no ID")
+		} else {
+			o.status.Fail(err)
+			if reconcileErr != nil {
+				return "", false, false, fmt.Errorf(
+					"create DNS record: %w; reconcile ambiguous result: %v",
+					err,
+					reconcileErr,
+				)
+			}
+			return "", false, false, err
+		}
 	}
-	return rec.ID, true, nil
+	return rec.ID, true, true, nil
+}
+
+func findMatchingDNS(
+	ctx context.Context,
+	cf *cloudflare.Client,
+	zoneID string,
+	name string,
+	content string,
+	comment string,
+) (cloudflare.DNSRecord, error) {
+	records, err := cf.ListDNS(ctx, zoneID, name, "CNAME")
+	if err != nil {
+		return cloudflare.DNSRecord{}, err
+	}
+	for _, record := range records {
+		if !strings.EqualFold(strings.TrimSpace(record.Name), strings.TrimSpace(name)) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSuffix(record.Content, "."), strings.TrimSuffix(content, ".")) {
+			continue
+		}
+		if comment != "" && record.Comment != comment {
+			continue
+		}
+		return record, nil
+	}
+	return cloudflare.DNSRecord{}, fmt.Errorf("created DNS record was not found")
 }
 
 func saveSetupProfile(
@@ -345,7 +694,7 @@ func saveSetupProfile(
 	return config.Save(cfg)
 }
 
-func verifySetup(ctx context.Context, cfg config.Config, tunnelToken, wildcard string) error {
+func verifySetup(ctx context.Context, cfg config.Config, tunnelToken, wildcard string) (err error) {
 	st, err := cloudflared.EnsureInstalled()
 	if err != nil {
 		return err
@@ -381,7 +730,11 @@ func verifySetup(ctx context.Context, cfg config.Config, tunnelToken, wildcard s
 	if err != nil {
 		return err
 	}
-	defer func() { _ = proc.Stop(5 * time.Second) }()
+	defer func() {
+		if stopErr := proc.Stop(5 * time.Second); err == nil && stopErr != nil {
+			err = fmt.Errorf("stop setup cloudflared: %w", stopErr)
+		}
+	}()
 	rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	if err := proc.WaitReady(rctx); err != nil {
@@ -461,7 +814,8 @@ func promptAPIToken() (token, preferAccount, preferZone string, err error) {
 		Title:       "API token",
 		Placeholder: "paste token",
 		Password:    true,
-		Hint:        "Create one at  https://dash.cloudflare.com/profile/api-tokens\n  Permissions: Account → Cloudflare Tunnel Edit, Zone → DNS Edit",
+		Hint: "Create one at  https://dash.cloudflare.com/profile/api-tokens\n" +
+			"  Required permissions: https://github.com/jordanliu/portx#custom-hostnames",
 	})
 	if err != nil {
 		return "", "", "", apperr.New(apperr.ExitInvalidArgs, "setup cancelled")

@@ -3,8 +3,11 @@ package origin
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"portx/internal/apperr"
 )
@@ -30,7 +33,17 @@ func ParsePublicURL(raw, wildcard string) (PublicRoute, error) {
 		if err != nil {
 			return PublicRoute{}, apperr.Wrap(apperr.ExitInvalidArgs, "parse --url", err)
 		}
-		host = u.Host
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return PublicRoute{}, apperr.New(apperr.ExitInvalidArgs, "public URL scheme must be http or https")
+		}
+		if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return PublicRoute{}, apperr.New(apperr.ExitInvalidArgs,
+				"public URLs must not include credentials, query parameters, or fragments")
+		}
+		host = u.Hostname()
+		if u.Port() != "" {
+			return PublicRoute{}, apperr.New(apperr.ExitInvalidArgs, "public hostname must not include a port")
+		}
 		if u.Path != "" {
 			path = u.Path
 		}
@@ -39,8 +52,8 @@ func ParsePublicURL(raw, wildcard string) (PublicRoute, error) {
 		path = raw[i:]
 	}
 
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return PublicRoute{}, apperr.New(apperr.ExitInvalidArgs, "public hostname must not include a port")
 	}
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	if host == "" {
@@ -51,6 +64,9 @@ func ParsePublicURL(raw, wildcard string) (PublicRoute, error) {
 	}
 	if path == "" {
 		path = "/"
+	}
+	if err := ValidatePathPrefix(path); err != nil {
+		return PublicRoute{}, err
 	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
@@ -115,6 +131,13 @@ func ValidateHostname(host, wildcard string) error {
 		return apperr.New(apperr.ExitInvalidArgs, "wildcard must look like *.example.dev")
 	}
 	suffix := strings.TrimPrefix(wildcard, "*")
+	if err := ValidateDNSHostname(strings.TrimPrefix(suffix, ".")); err != nil {
+		return apperr.New(apperr.ExitInvalidArgs, "wildcard must contain a valid DNS suffix")
+	}
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if err := ValidateDNSHostname(host); err != nil {
+		return err
+	}
 	if !strings.HasSuffix(host, suffix) {
 		return apperr.New(apperr.ExitInvalidArgs, fmt.Sprintf(
 			"hostname %q is outside namespace %s\n\nUse a full name (api%s) or short label (api).",
@@ -126,8 +149,109 @@ func ValidateHostname(host, wildcard string) error {
 			"hostname %q must be a single label under %s\n\nExamples:  --url=api   or   --url=api%s",
 			host, wildcard, suffix))
 	}
-	if strings.ContainsAny(label, " /\\") {
-		return apperr.New(apperr.ExitInvalidArgs, "invalid hostname label")
+	return nil
+}
+
+// ValidateDNSHostname validates a hostname without requiring a particular DNS namespace.
+func ValidateDNSHostname(host string) error {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if host == "" || len(host) > 253 {
+		return apperr.New(apperr.ExitInvalidArgs, "hostname must be 1-253 characters")
+	}
+	for _, label := range strings.Split(host, ".") {
+		if err := validateDNSLabel(label); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// ValidateHostHeader validates an origin Host override, including an optional port.
+func ValidateHostHeader(host string) error {
+	if host == "" || strings.IndexFunc(host, unicode.IsControl) >= 0 || strings.ContainsAny(host, " \t/\\?#@") {
+		return apperr.New(apperr.ExitInvalidArgs, "invalid host header")
+	}
+
+	hostname := host
+	port := ""
+	if strings.HasPrefix(host, "[") {
+		end := strings.IndexByte(host, ']')
+		if end < 0 {
+			return apperr.New(apperr.ExitInvalidArgs, "invalid bracketed host header")
+		}
+		hostname = host[1:end]
+		rest := host[end+1:]
+		if rest != "" {
+			if !strings.HasPrefix(rest, ":") {
+				return apperr.New(apperr.ExitInvalidArgs, "invalid host header")
+			}
+			port = rest[1:]
+		}
+		if !isIPLiteral(hostname) || !strings.Contains(hostname, ":") {
+			return apperr.New(apperr.ExitInvalidArgs, "bracketed host header must contain an IPv6 address")
+		}
+	} else if strings.Count(host, ":") == 1 {
+		var err error
+		hostname, port, err = net.SplitHostPort(host)
+		if err != nil {
+			return apperr.New(apperr.ExitInvalidArgs, "invalid host header port")
+		}
+	} else if strings.Contains(host, ":") {
+		return apperr.New(apperr.ExitInvalidArgs, "IPv6 host headers must use brackets")
+	}
+
+	if port != "" {
+		value, err := strconv.Atoi(port)
+		if err != nil || value < 1 || value > 65535 {
+			return apperr.New(apperr.ExitInvalidArgs, "host header port must be 1-65535")
+		}
+	}
+	if isIPLiteral(hostname) {
+		return nil
+	}
+	return ValidateDNSHostname(hostname)
+}
+
+// ValidatePathPrefix validates the path used to select a managed route.
+func ValidatePathPrefix(path string) error {
+	if path == "" {
+		return nil
+	}
+	if !strings.HasPrefix(path, "/") {
+		return apperr.New(apperr.ExitInvalidArgs, "path prefix must start with /")
+	}
+	if strings.IndexFunc(path, unicode.IsControl) >= 0 || strings.ContainsAny(path, "\\?#") {
+		return apperr.New(apperr.ExitInvalidArgs, "path prefix contains invalid characters")
+	}
+	for _, segment := range strings.Split(path, "/") {
+		if segment == "." || segment == ".." {
+			return apperr.New(apperr.ExitInvalidArgs, "path prefix must not contain . or .. segments")
+		}
+	}
+	return nil
+}
+
+func validateDNSLabel(label string) error {
+	if label == "" || len(label) > 63 {
+		return apperr.New(apperr.ExitInvalidArgs, "hostname labels must be 1-63 characters")
+	}
+	for i, r := range label {
+		isLetter := r >= 'a' && r <= 'z'
+		isDigit := r >= '0' && r <= '9'
+		if !isLetter && !isDigit && r != '-' {
+			return apperr.New(apperr.ExitInvalidArgs, fmt.Sprintf("invalid hostname label %q", label))
+		}
+		if (i == 0 || i == len(label)-1) && r == '-' {
+			return apperr.New(apperr.ExitInvalidArgs, "hostname labels cannot start or end with a hyphen")
+		}
+	}
+	return nil
+}
+
+func isIPLiteral(host string) bool {
+	if strings.Contains(host, "%") {
+		host = host[:strings.LastIndexByte(host, '%')]
+	}
+	_, err := netip.ParseAddr(host)
+	return err == nil
 }

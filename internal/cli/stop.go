@@ -10,6 +10,7 @@ import (
 
 	"portx/internal/apperr"
 	"portx/internal/config"
+	"portx/internal/leases"
 	"portx/internal/rpc"
 	"portx/internal/ui"
 )
@@ -37,21 +38,62 @@ func stopCommand() *cli.Command {
 			if err != nil {
 				return err
 			}
-			for _, l := range list {
-				matches := l.ID == id ||
-					strings.HasPrefix(l.ID, id) ||
-					l.Hostname == id ||
-					l.RouteID == id
-				if !matches {
-					continue
-				}
-				if err := c.ForceRelease(l.ID); err != nil {
-					return err
-				}
-				ui.Success("Stopped %s", l.Hostname)
-				return nil
+			matches := matchingLeases(list, id)
+			if len(matches) == 0 {
+				return apperr.New(
+					apperr.ExitDaemon,
+					fmt.Sprintf("no active lease matching %q", id),
+				)
 			}
-			return apperr.New(apperr.ExitDaemon, fmt.Sprintf("no active lease matching %q", id))
+			if len(matches) > 1 {
+				return ambiguousLeaseError(id, matches)
+			}
+			lease := matches[0]
+			if err := c.ForceRelease(lease.ID); err != nil {
+				return err
+			}
+			ui.Success("Stopped %s", leaseSelector(lease))
+			return nil
 		},
 	}
+}
+
+func matchingLeases(list []leases.Lease, selector string) []leases.Lease {
+	exact := make([]leases.Lease, 0, 1)
+	for _, lease := range list {
+		if lease.ID == selector || lease.RouteID == selector || leaseSelector(lease) == selector {
+			exact = append(exact, lease)
+		}
+	}
+	if len(exact) > 0 {
+		return exact
+	}
+
+	prefix := make([]leases.Lease, 0, 1)
+	for _, lease := range list {
+		if strings.HasPrefix(lease.ID, selector) {
+			prefix = append(prefix, lease)
+		}
+	}
+	if len(prefix) > 0 {
+		return prefix
+	}
+
+	hostname := make([]leases.Lease, 0, 1)
+	for _, lease := range list {
+		if lease.Hostname == selector {
+			hostname = append(hostname, lease)
+		}
+	}
+	return hostname
+}
+
+func ambiguousLeaseError(selector string, matches []leases.Lease) error {
+	lines := []string{
+		fmt.Sprintf("ambiguous lease selector %q; choose a lease ID or route:", selector),
+	}
+	for _, lease := range sortedLeases(matches) {
+		lines = append(lines, fmt.Sprintf("  %s  %s", shortLeaseID(lease.ID), leaseSelector(lease)))
+	}
+	return apperr.New(apperr.ExitInvalidArgs, strings.Join(lines, "\n"))
 }

@@ -5,39 +5,140 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Build & publish
-    runs-on: ubuntu-latest
+  platform-validation:
+    name: Validate (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux amd64
+            os: ubuntu-latest
+            binary: bin/portx
+          - name: macOS native
+            os: macos-latest
+            binary: bin/portx
+          - name: Windows amd64
+            os: windows-latest
+            binary: bin/portx.exe
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Test
-        run: go test ./...
+        run: go test -count=1 ./...
+
+      - name: Race test
+        if: runner.os != 'Windows'
+        run: go test -race -count=1 ./...
+
+      - name: Build native binary
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+        run: |
+          mkdir -p bin
+          go build -trimpath -buildvcs=false -o "$BINARY" ./cmd/portx
+
+      - name: Smoke test native binary
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+        run: |
+          "$BINARY" version
+          "$BINARY" help >/dev/null
+
+  release:
+    name: Build & publish
+    needs: platform-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      source_sha256: ${{ steps.dist.outputs.source_sha256 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify release source
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          test -z "$(git status --porcelain)"
+          git diff-tree --check --no-commit-id -r "$GITHUB_SHA"
+
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "Release tag must point to a commit reachable from main" >&2
+            exit 1
+          fi
+
+          if ! git tag --points-at "$GITHUB_SHA" | grep -Fxq "$GITHUB_REF_NAME"; then
+            echo "Release tag does not point at the checked-out commit" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Module verification
+        run: go mod verify
+
+      - name: Release quality gates
+        run: make check
 
       - name: Version metadata
         id: meta
         run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use semantic versioning, for example v1.2.3" >&2
+            exit 1
+          fi
+
           VERSION="${GITHUB_REF_NAME#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
           echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Build release binaries
+        id: dist
         env:
           VERSION: ${{ steps.meta.outputs.version }}
           COMMIT: ${{ steps.meta.outputs.commit }}
@@ -50,7 +151,7 @@ jobs:
             local goos=$1 goarch=$2 out=$3
             echo "building $out"
             GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags "$LDFLAGS" -o "dist/$out" ./cmd/portx
+              go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "dist/$out" ./cmd/portx
           }
 
           build darwin arm64  "portx_${VERSION}_darwin_arm64"
@@ -59,25 +160,42 @@ jobs:
           build linux  arm64  "portx_${VERSION}_linux_arm64"
           build windows amd64 "portx_${VERSION}_windows_amd64.exe"
 
-          # Source archive for Homebrew
-          git archive --format=tar.gz --prefix="portx-${VERSION}/" -o "dist/portx-${VERSION}.tar.gz" HEAD
+          test -x "dist/portx_${VERSION}_linux_amd64"
+          "dist/portx_${VERSION}_linux_amd64" version
+
+          # Reproducible source archive for Homebrew.
+          git archive \
+            --format=tar \
+            --mtime="@${{ steps.meta.outputs.source_date_epoch }}" \
+            --prefix="portx-${VERSION}/" HEAD | gzip -n > "dist/portx-${VERSION}.tar.gz"
+
+          tar -tzf "dist/portx-${VERSION}.tar.gz" | grep -Fxq "portx-${VERSION}/go.mod"
+          if tar -tzf "dist/portx-${VERSION}.tar.gz" | grep -Eq '(^|/)\.git(/|$)'; then
+            echo "Source archive must not contain Git metadata" >&2
+            exit 1
+          fi
 
           cd dist
-          shasum -a 256 portx_* > SHA256SUMS
+          sha256sum portx_* portx-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
+
+          sha256sum -c SHA256SUMS
+
+          SOURCE_SHA256="$(sha256sum "portx-${VERSION}.tar.gz" | awk '{print $1}')"
+          echo "source_sha256=${SOURCE_SHA256}" >> "$GITHUB_OUTPUT"
 
           # Print Homebrew formula fields for maintainers
           {
             echo "## Homebrew formula update"
             echo ""
             echo '```ruby'
-            echo "url \"https://github.com/${{ github.repository }}/archive/refs/tags/${{ steps.meta.outputs.tag }}.tar.gz\""
-            echo "sha256 \"$(shasum -a 256 "portx-${VERSION}.tar.gz" | awk '{print $1}')\""
+            echo "url \"https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}/portx-${VERSION}.tar.gz\""
+            echo "sha256 \"${SOURCE_SHA256}\""
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: PortX ${{ steps.meta.outputs.version }}
@@ -89,11 +207,251 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Optional: verify formula builds on macOS after release (needs public tag/tarball)
-  # brew-install:
-  #   needs: release
-  #   runs-on: macos-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - run: brew install cloudflared
-  #     - run: brew install --build-from-source Formula/portx.rb
+  homebrew:
+    name: Open Homebrew tap PR
+    needs: release
+    if: needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    outputs:
+      tap_status: ${{ steps.tap.outputs.tap_status }}
+      pr_url: ${{ steps.tap.outputs.pr_url }}
+
+    env:
+      TAP_REPOSITORY: jordanliu/homebrew-portx
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+    steps:
+      - name: Check tap token
+        run: |
+          if [[ -z "$TAP_TOKEN" ]]; then
+            echo "Missing HOMEBREW_TAP_TOKEN repository secret" >&2
+            exit 1
+          fi
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.TAP_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          TAG: ${{ needs.release.outputs.tag }}
+          SOURCE_SHA256: ${{ needs.release.outputs.source_sha256 }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$TAG" != "v${VERSION}" ]]; then
+            echo "Release metadata is not a stable semantic version" >&2
+            exit 1
+          fi
+          if [[ "$SOURCE_REPOSITORY" != "jordanliu/portx" ]]; then
+            echo "Unexpected source repository: $SOURCE_REPOSITORY" >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Release job did not produce a valid source archive SHA256" >&2
+            exit 1
+          fi
+
+          ARCHIVE_URL="https://github.com/${SOURCE_REPOSITORY}/releases/download/${TAG}/portx-${VERSION}.tar.gz"
+          curl --fail --location --retry 5 --retry-delay 2 --silent --show-error \
+            "$ARCHIVE_URL" -o /tmp/portx-source.tar.gz
+          printf '%s  %s\n' "$SOURCE_SHA256" /tmp/portx-source.tar.gz | sha256sum -c -
+          tar -tzf /tmp/portx-source.tar.gz | grep -Fxq "portx-${VERSION}/go.mod"
+
+          BRANCH="update-portx-${TAG}"
+          git -C tap fetch origin "$BRANCH" 2>/dev/null || true
+          if git -C tap show-ref --verify --quiet "refs/remotes/origin/${BRANCH}"; then
+            git -C tap switch -c "$BRANCH" --track "origin/${BRANCH}"
+          else
+            git -C tap switch -c "$BRANCH"
+          fi
+
+          if [[ ! -f tap/Formula/portx.rb ]]; then
+            echo "Homebrew tap is missing Formula/portx.rb" >&2
+            exit 1
+          fi
+
+          ruby - "$VERSION" "$TAG" "$SOURCE_SHA256" "$SOURCE_REPOSITORY" <<'RUBY'
+          version, tag, sha256, repository = ARGV
+          path = "tap/Formula/portx.rb"
+          formula = File.read(path)
+          url = "https://github.com/#{repository}/releases/download/#{tag}/portx-#{version}.tar.gz"
+          url_pattern = /^[ \t]+url "([^"]+)"$/
+          sha_pattern = /^[ \t]+sha256 "([^"]+)"$/
+
+          abort "Formula must contain exactly one url line" unless formula.scan(url_pattern).length == 1
+          abort "Formula must contain exactly one sha256 line" unless formula.scan(sha_pattern).length == 1
+
+          formula.sub!(url_pattern, "  url \"#{url}\"")
+          formula.sub!(sha_pattern, "  sha256 \"#{sha256}\"")
+
+          abort "Formula is missing a url line" unless formula.include?(url)
+          abort "Formula is missing a sha256 line" unless formula.include?(sha256)
+
+          File.write(path, formula)
+          RUBY
+
+          ruby -c tap/Formula/portx.rb
+
+          if grep -Eq 'sha256 "0{64}"' tap/Formula/portx.rb; then
+            echo "Formula still contains the pre-release placeholder SHA256" >&2
+            exit 1
+          fi
+
+          EXPECTED_URL="https://github.com/${SOURCE_REPOSITORY}/releases/download/${TAG}/portx-${VERSION}.tar.gz"
+          grep -Fq "url \"${EXPECTED_URL}\"" tap/Formula/portx.rb || {
+            echo "Formula URL does not match the release archive" >&2
+            exit 1
+          }
+
+      - name: Create formula PR
+        id: tap
+        working-directory: tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+          TAG: ${{ needs.release.outputs.tag }}
+          SOURCE_SHA256: ${{ needs.release.outputs.source_sha256 }}
+        run: |
+          BRANCH="update-portx-${TAG}"
+          EXPECTED_URL="https://github.com/jordanliu/portx/releases/download/${TAG}/portx-${VERSION}.tar.gz"
+
+          if git diff --quiet -- Formula/portx.rb; then
+            if git show origin/main:Formula/portx.rb | grep -Fq "url \"${EXPECTED_URL}\"" && \
+              git show origin/main:Formula/portx.rb | grep -Fq "sha256 \"${SOURCE_SHA256}\""; then
+              echo "Formula update for ${TAG} is already merged into main"
+              echo "tap_status=merged" >> "$GITHUB_OUTPUT"
+              echo "pr_url=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            pr_count="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json number --jq 'length')"
+            if [[ "$pr_count" == "1" ]]; then
+              pr_url="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json url --jq '.[0].url')"
+              pr_base="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json baseRefName --jq '.[0].baseRefName')"
+              if [[ "$pr_base" == "main" && "$pr_url" =~ ^https://github\.com/${TAP_REPOSITORY}/pull/[0-9]+$ ]]; then
+                echo "Existing open formula PR confirmed for ${TAG}"
+                echo "tap_status=pr" >> "$GITHUB_OUTPUT"
+                echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+
+            echo "Formula already matches ${TAG}, but no merged update or PR was confirmed" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git diff --check
+          git add Formula/portx.rb
+          git commit -m "chore: update portx to ${TAG}"
+          git push --set-upstream origin "$BRANCH"
+
+          pr_count="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json number --jq 'length')"
+          if [[ "$pr_count" == "0" ]]; then
+            cat > /tmp/portx-homebrew-pr-body <<EOF
+            Updates the PortX Homebrew formula to the ${TAG} release.
+
+            Source archive SHA256: ${SOURCE_SHA256}
+            EOF
+
+            gh pr create \
+              --repo "$TAP_REPOSITORY" \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore: update portx to ${TAG}" \
+              --body-file /tmp/portx-homebrew-pr-body
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            pr_count="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json number --jq 'length')"
+            [[ "$pr_count" == "1" ]] && break
+            sleep 2
+          done
+
+          if [[ "$pr_count" != "1" ]]; then
+            echo "Expected exactly one open Homebrew PR for ${BRANCH}; found ${pr_count}" >&2
+            exit 1
+          fi
+
+          pr_url="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json url --jq '.[0].url')"
+          pr_base="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json baseRefName --jq '.[0].baseRefName')"
+          if [[ "$pr_base" != "main" || ! "$pr_url" =~ ^https://github\.com/${TAP_REPOSITORY}/pull/[0-9]+$ ]]; then
+            echo "Homebrew PR has an unexpected base or URL" >&2
+            exit 1
+          fi
+
+          echo "tap_status=pr" >> "$GITHUB_OUTPUT"
+          echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
+
+      - name: Report tap automation status
+        if: always()
+        run: |
+          {
+            echo "## Homebrew tap automation"
+            echo ""
+            echo "Repository: \\`${TAP_REPOSITORY}\\`"
+            echo "Release: \\`${{ needs.release.outputs.tag }}\\`"
+            echo "Tap status: \\`${{ steps.tap.outputs.tap_status }}\\`"
+            if [[ -n "${{ steps.tap.outputs.pr_url }}" ]]; then
+              echo "Tap PR: ${{ steps.tap.outputs.pr_url }}"
+            fi
+            echo ""
+            if [[ "${{ job.status }}" == "success" ]]; then
+              echo "The formula update was validated and a merged update or exactly one open pull request was confirmed."
+            else
+              echo "The release succeeded, but the Homebrew tap update failed. Check this job before announcing Homebrew availability."
+              echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release-readiness:
+    name: Confirm release readiness
+    needs: [release, homebrew]
+    if: needs.release.result == 'success' && needs.homebrew.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    env:
+      TAP_REPOSITORY: jordanliu/homebrew-portx
+      TAP_STATUS: ${{ needs.homebrew.outputs.tap_status }}
+      TAP_PR_URL: ${{ needs.homebrew.outputs.pr_url }}
+      TAG: ${{ needs.release.outputs.tag }}
+      VERSION: ${{ needs.release.outputs.version }}
+
+    steps:
+      - name: Confirm Homebrew result
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          case "$TAP_STATUS" in
+            merged)
+              test -z "$TAP_PR_URL"
+              ;;
+            pr)
+              [[ "$TAP_PR_URL" =~ ^https://github\.com/${TAP_REPOSITORY}/pull/[0-9]+$ ]]
+              state="$(gh pr view "$TAP_PR_URL" --repo "$TAP_REPOSITORY" --json state,baseRefName --jq '[.state, .baseRefName] | @tsv')"
+              [[ "$state" == $'OPEN\tmain' ]]
+              ;;
+            *)
+              echo "Homebrew job did not report a confirmed result" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Confirm published source archive
+        run: |
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/portx-${VERSION}.tar.gz"
+          curl --fail --location --retry 5 --retry-delay 2 --silent --show-error --head "$URL"

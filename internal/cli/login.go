@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -34,8 +32,8 @@ func loginCommand() *cli.Command {
 			ui.KeyValue("cloudflared", st.Version+"  "+st.Path)
 
 			if cmd.Bool("force") {
-				if home, err := os.UserHomeDir(); err == nil {
-					_ = os.Remove(filepath.Join(home, ".cloudflared", "cert.pem"))
+				if err := auth.RemoveBrowserCredentials(); err != nil {
+					return err
 				}
 			}
 

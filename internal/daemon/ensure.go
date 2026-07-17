@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,7 +12,10 @@ import (
 	"portx/internal/rpc"
 )
 
-func EnsureRunning(profile string) (*rpc.Client, error) {
+func EnsureRunning(ctx context.Context, profile string) (*rpc.Client, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	runtimeDir, err := config.RuntimeDir()
 	if err != nil {
 		return nil, err
@@ -27,42 +31,83 @@ func EnsureRunning(profile string) (*rpc.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	logFile, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	cmd := exec.Command(self, "--profile", profile, "daemon", "run")
-	if logFile != nil {
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
+	logFile, err := openDaemonLog(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("open daemon log: %w", err)
 	}
+	cmd := exec.CommandContext(ctx, self, "--profile", profile, "daemon", "run")
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 	cmd.Stdin = nil
 	if err := cmd.Start(); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
+		_ = logFile.Close()
 		return nil, err
 	}
+	waitDone := make(chan error, 1)
 	go func() {
-		_ = cmd.Wait()
-		if logFile != nil {
-			_ = logFile.Close()
-		}
+		waitDone <- cmd.Wait()
+		_ = logFile.Close()
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
 		if c, err := dialDaemon(sock, profile); err == nil {
 			return c, nil
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	hint := ""
-	if b, err := os.ReadFile(logPath); err == nil && len(b) > 0 {
-		tail := string(b)
-		if len(tail) > 400 {
-			tail = tail[len(tail)-400:]
+		select {
+		case <-ctx.Done():
+			stopStartedDaemon(cmd, waitDone)
+			return nil, ctx.Err()
+		case <-deadline.C:
+			stopStartedDaemon(cmd, waitDone)
+			hint := ""
+			if b, err := os.ReadFile(logPath); err == nil && len(b) > 0 {
+				tail := string(b)
+				if len(tail) > 400 {
+					tail = tail[len(tail)-400:]
+				}
+				hint = "\n\nDaemon log:\n" + tail
+			}
+			return nil, fmt.Errorf("daemon did not become ready (is proxy port free?)%s\n\nSee: %s", hint, logPath)
+		case <-time.After(100 * time.Millisecond):
 		}
-		hint = "\n\nDaemon log:\n" + tail
 	}
-	return nil, fmt.Errorf("daemon did not become ready (is proxy port free?)%s\n\nSee: %s", hint, logPath)
+}
+
+func openDaemonLog(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("daemon log path is not a regular file: %q", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func stopStartedDaemon(cmd *exec.Cmd, waitDone <-chan error) {
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+	}
 }
 
 func dialDaemon(sock, profile string) (*rpc.Client, error) {

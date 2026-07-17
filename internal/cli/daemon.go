@@ -6,7 +6,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/urfave/cli/v3"
@@ -14,7 +13,6 @@ import (
 	"portx/internal/apperr"
 	"portx/internal/config"
 	"portx/internal/daemon"
-	"portx/internal/procutil"
 	"portx/internal/rpc"
 	"portx/internal/ui"
 )
@@ -76,19 +74,16 @@ func daemonCommand() *cli.Command {
 						return err
 					}
 					pidFile := filepath.Join(runtimeDir, "portxd.pid")
-					b, err := os.ReadFile(pidFile)
-					if err != nil {
+					if _, err := os.Stat(pidFile); err != nil {
 						return apperr.New(apperr.ExitDaemon, "daemon not running")
 					}
-					pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-					if err != nil || pid <= 0 {
-						return apperr.New(apperr.ExitDaemon, "invalid pid file")
+					if err := stopDaemon(pidFile); err != nil {
+						return apperr.Wrap(apperr.ExitDaemon, "stop daemon", err)
 					}
-					if !procutil.Alive(pid) {
-						_ = os.Remove(pidFile)
-						return apperr.New(apperr.ExitDaemon, "daemon not running")
+					if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+						return apperr.Wrap(apperr.ExitDaemon, "remove daemon pid file", err)
 					}
-					return procutil.Interrupt(pid)
+					return nil
 				},
 			},
 		},

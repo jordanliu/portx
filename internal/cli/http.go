@@ -21,6 +21,7 @@ import (
 	"portx/internal/cloudflared"
 	"portx/internal/config"
 	"portx/internal/daemon"
+	"portx/internal/httpx"
 	"portx/internal/origin"
 	"portx/internal/rpc"
 	"portx/internal/ui"
@@ -64,6 +65,11 @@ func runHTTP(ctx context.Context, cmd *cli.Command) error {
 			return apperr.New(apperr.ExitInvalidArgs, "scheme must be http or https")
 		}
 		target.Scheme = scheme
+	}
+	if hostHeader := cmd.String("host-header"); hostHeader != "" {
+		if err := origin.ValidateHostHeader(hostHeader); err != nil {
+			return err
+		}
 	}
 	if err := origin.ValidateTargetSafety(target); err != nil {
 		return err
@@ -163,8 +169,16 @@ func saveProjectRoute(cmd *cli.Command, target *url.URL, public string) error {
 	if err := config.SaveProject("", pc); err != nil {
 		return err
 	}
-	ui.Success("saved route %q to %s", name, config.ProjectFileName)
+	reportSavedRoute(cmd.Bool("json"), name)
 	return nil
+}
+
+func reportSavedRoute(jsonOutput bool, name string) {
+	if jsonOutput {
+		fmt.Fprintf(os.Stderr, "saved route %q to %s\n", name, config.ProjectFileName)
+		return
+	}
+	ui.Success("saved route %q to %s", name, config.ProjectFileName)
 }
 
 func runQuickHTTP(ctx context.Context, cmd *cli.Command, target *url.URL) error {
@@ -177,7 +191,7 @@ func runQuickHTTP(ctx context.Context, cmd *cli.Command, target *url.URL) error 
 		srv  *http.Server
 		ln   net.Listener
 	)
-	err := ui.RunSession(func(p *tea.Program) error {
+	err := ui.RunSession(ctx, func(sessionCtx context.Context, p *tea.Program) error {
 		ui.SetPhase(p, "Checking cloudflared")
 		st, err := cloudflared.EnsureInstalled()
 		if err != nil {
@@ -190,11 +204,11 @@ func runQuickHTTP(ctx context.Context, cmd *cli.Command, target *url.URL) error 
 		if lerr != nil {
 			return lerr
 		}
-		srv = &http.Server{Handler: handler, ReadHeaderTimeout: 30 * time.Second}
+		srv = newOriginHTTPServer(handler)
 		go func() { _ = srv.Serve(ln) }()
 
 		ui.SetPhase(p, "Starting Quick Tunnel")
-		proc, err = cloudflared.StartQuick(context.Background(), st.Path, cloudflared.QuickOptions{
+		proc, err = cloudflared.StartQuick(sessionCtx, st.Path, cloudflared.QuickOptions{
 			OriginURL: "http://" + ln.Addr().String(),
 		})
 		if err != nil {
@@ -202,7 +216,7 @@ func runQuickHTTP(ctx context.Context, cmd *cli.Command, target *url.URL) error 
 		}
 
 		ui.SetPhase(p, "Waiting for public URL")
-		waitCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		waitCtx, cancel := context.WithTimeout(sessionCtx, 45*time.Second)
 		defer cancel()
 		public, err := proc.WaitQuickURL(waitCtx)
 		if err != nil {
@@ -238,7 +252,7 @@ func runQuickHTTPJSON(ctx context.Context, cmd *cli.Command, target *url.URL) er
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 30 * time.Second}
+	srv := newOriginHTTPServer(handler)
 	go func() { _ = srv.Serve(ln) }()
 	defer func() {
 		shctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -292,7 +306,10 @@ func runManagedHTTP(ctx context.Context, cmd *cli.Command, target *url.URL, publ
 	profileName := config.ResolveProfile(cmd.String("profile"), "", cfg.DefaultProfile)
 	prof, err := cfg.Profile(profileName)
 	if err != nil || !prof.IsConfigured() {
-		return apperr.New(apperr.ExitInvalidArgs, "Custom hostnames require one-time setup.\n\nRun:\n  portx setup\n\nFor an immediate random URL:\n  portx http 3000")
+		return apperr.New(
+			apperr.ExitInvalidArgs,
+			"Custom hostnames require one-time setup.\n\nRun:\n  portx setup\n\nFor an immediate random URL:\n  portx http 3000",
+		)
 	}
 	route, err := origin.ParsePublicURL(public, prof.Wildcard)
 	if err != nil {
@@ -307,16 +324,16 @@ func runManagedHTTP(ctx context.Context, cmd *cli.Command, target *url.URL, publ
 		hbEvery = 15 * time.Second
 	}
 
-	err = ui.RunSession(func(p *tea.Program) error {
+	err = ui.RunSession(ctx, func(sessionCtx context.Context, p *tea.Program) error {
 		ui.SetPhase(p, "Starting local daemon")
 		var err error
-		client, err = daemon.EnsureRunning(profileName)
+		client, err = daemon.EnsureRunning(sessionCtx, profileName)
 		if err != nil {
 			return apperr.Wrap(apperr.ExitDaemon, "start daemon", err)
 		}
 
 		ui.SetPhase(p, "Connecting Cloudflare tunnel")
-		if err := client.StartTunnel(); err != nil {
+		if err := client.StartTunnelContext(sessionCtx); err != nil {
 			return err
 		}
 
@@ -372,18 +389,21 @@ func runManagedHTTPJSON(ctx context.Context, cmd *cli.Command, target *url.URL, 
 	profileName := config.ResolveProfile(cmd.String("profile"), "", cfg.DefaultProfile)
 	prof, err := cfg.Profile(profileName)
 	if err != nil || !prof.IsConfigured() {
-		return apperr.New(apperr.ExitInvalidArgs, "Custom hostnames require one-time setup.\n\nRun:\n  portx setup\n\nFor an immediate random URL:\n  portx http 3000")
+		return apperr.New(
+			apperr.ExitInvalidArgs,
+			"Custom hostnames require one-time setup.\n\nRun:\n  portx setup\n\nFor an immediate random URL:\n  portx http 3000",
+		)
 	}
 	route, err := origin.ParsePublicURL(public, prof.Wildcard)
 	if err != nil {
 		return err
 	}
-	client, err := daemon.EnsureRunning(profileName)
+	client, err := daemon.EnsureRunning(ctx, profileName)
 	if err != nil {
 		return err
 	}
 	defer client.Close()
-	if err := client.StartTunnel(); err != nil {
+	if err := client.StartTunnelContext(ctx); err != nil {
 		return err
 	}
 	l, err := client.AcquireLease(rpc.AcquireParams{
@@ -427,23 +447,65 @@ func runManagedHTTPJSON(ctx context.Context, cmd *cli.Command, target *url.URL, 
 }
 
 func newOriginProxy(target *url.URL, hostHeader string, insecure bool) http.Handler {
-	rp := httputil.NewSingleHostReverseProxy(target)
+	rp := &httputil.ReverseProxy{}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = nil
+	tr.DialContext = origin.SafeDialContext
+	tr.ResponseHeaderTimeout = 30 * time.Second
 	if target.Scheme == "https" {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: insecure, MinVersion: tls.VersionTLS12} //nolint:gosec
 	}
 	rp.Transport = tr
 	rp.FlushInterval = 100 * time.Millisecond
-	orig := rp.Director
-	rp.Director = func(req *http.Request) {
-		orig(req)
-		req.Host = target.Host
-		if hostHeader != "" {
-			req.Host = hostHeader
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+			return nil
 		}
-		req.Header.Set("X-PortX-Request-ID", uuid.NewString())
-		req.Header.Set("X-Forwarded-Proto", "https")
+		resp.Body = httpx.NewIdleTimeoutBody(
+			resp.Body,
+			httpx.ResponseBodyIdleLimit,
+		)
+		return nil
 	}
-	return rp
+	rp.Rewrite = func(proxyReq *httputil.ProxyRequest) {
+		proxyReq.SetURL(target)
+		proxyReq.Out.Host = target.Host
+		if hostHeader != "" {
+			proxyReq.Out.Host = hostHeader
+		}
+		stripForwardingHeaders(proxyReq.Out.Header)
+		proxyReq.Out.Header.Set("X-PortX-Request-ID", uuid.NewString())
+		proxyReq.Out.Header.Set("X-Forwarded-Proto", "https")
+	}
+	return withRequestBodyIdleTimeout(rp)
+}
+
+func withRequestBodyIdleTimeout(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body == nil || r.Body == http.NoBody {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		r.Body = httpx.NewIdleTimeoutBody(r.Body, httpx.RequestBodyIdleLimit)
+		defer r.Body.Close()
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func stripForwardingHeaders(header http.Header) {
+	for _, name := range []string{
+		"Forwarded",
+		"X-Forwarded-For",
+		"X-Forwarded-Host",
+		"X-Forwarded-Port",
+		"X-Forwarded-Proto",
+		"X-Real-IP",
+		"CF-Connecting-IP",
+	} {
+		header.Del(name)
+	}
+}
+
+func newOriginHTTPServer(handler http.Handler) *http.Server {
+	return httpx.NewServer(handler)
 }

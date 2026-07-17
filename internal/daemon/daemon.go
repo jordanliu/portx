@@ -2,10 +2,15 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +23,7 @@ import (
 	"portx/internal/credentials"
 	"portx/internal/leases"
 	"portx/internal/origin"
+	"portx/internal/procutil"
 	"portx/internal/router"
 	"portx/internal/rpc"
 )
@@ -78,8 +84,16 @@ func (d *Daemon) LockPath() string {
 	return filepath.Join(d.runtimeDir, "portxd.lock")
 }
 
-func (d *Daemon) Run(ctx context.Context) error {
-	d.runCtx = ctx
+func (d *Daemon) Run(ctx context.Context) (runErr error) {
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	d.mu.Lock()
+	d.runCtx = runCtx
+	d.mu.Unlock()
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
 
 	lock, err := os.OpenFile(d.LockPath(), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -101,29 +115,48 @@ func (d *Daemon) Run(ctx context.Context) error {
 		_ = ln.Close()
 	}()
 
-	_ = os.WriteFile(d.PidPath(), []byte(strconv.Itoa(os.Getpid())), 0o600)
-	defer os.Remove(d.PidPath())
-
-	d.leases.Reconcile()
-	go d.leases.ExpireLoop(d.stopCh, 5*time.Second)
+	pidRecord, err := newPIDRecord(os.Getpid(), executable, "portxd")
+	if err != nil {
+		return err
+	}
+	if err := writePIDRecord(d.PidPath(), pidRecord); err != nil {
+		return fmt.Errorf("write daemon pid file: %w", err)
+	}
 
 	rpcServer := rpc.NewServer(d)
+	defer func() {
+		cancelRun()
+		close(d.stopCh)
+		cleanupErr := errors.Join(
+			rpcServer.Close(),
+			removeIfPresent(d.SocketPath()),
+			d.StopTunnel(),
+			removeIfPresent(d.PidPath()),
+		)
+		if cleanupErr != nil {
+			runErr = errors.Join(runErr, cleanupErr)
+		}
+	}()
+
+	if _, err := d.leases.ReconcileWithError(); err != nil {
+		log.Printf("portx: lease reconciliation failed: %v", err)
+	}
+	go d.leases.ExpireLoopWithError(d.stopCh, 5*time.Second, func(changed bool, err error) {
+		if err != nil {
+			log.Printf("portx: lease expiry cleanup failed: %v", err)
+		}
+		if changed && len(d.leases.List()) == 0 {
+			d.scheduleIdle()
+		}
+	})
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- rpcServer.Serve(d.SocketPath()) }()
 
 	select {
 	case <-ctx.Done():
-		close(d.stopCh)
-		_ = rpcServer.Close()
-		_ = os.Remove(d.SocketPath())
-		d.mu.Lock()
-		if d.cfProc != nil {
-			_ = d.cfProc.Stop(10 * time.Second)
-		}
-		d.mu.Unlock()
 		return nil
 	case err := <-errCh:
-		close(d.stopCh)
 		return err
 	}
 }
@@ -144,9 +177,22 @@ func (d *Daemon) GetStatus() (rpc.StatusResult, error) {
 }
 
 func (d *Daemon) AcquireLease(p rpc.AcquireParams) (leases.Lease, error) {
+	return d.AcquireLeaseContext(context.Background(), p)
+}
+
+func (d *Daemon) AcquireLeaseContext(ctx context.Context, p rpc.AcquireParams) (leases.Lease, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return leases.Lease{}, err
+	}
 	// Security boundary: re-validate everything the CLI may have skipped.
 	prof, err := d.cfg.Profile(d.profile)
 	if err != nil {
+		if len(d.leases.List()) == 0 {
+			d.scheduleIdle()
+		}
 		return leases.Lease{}, err
 	}
 	if !prof.IsConfigured() {
@@ -167,28 +213,48 @@ func (d *Daemon) AcquireLease(p rpc.AcquireParams) (leases.Lease, error) {
 	}
 
 	// Cancel idle before tunnel/lease work so a firing timer cannot stop a new session.
+	tunnelWasRunning := d.tunnelRunning()
 	d.cancelIdle()
 
-	if err := d.StartTunnel(); err != nil {
+	if err := d.StartTunnelContext(ctx); err != nil {
+		d.scheduleIdleIfUnused()
 		return leases.Lease{}, err
 	}
 	l, err := d.leases.Acquire(leases.AcquireRequest{
-		Hostname:   p.Hostname,
-		PathPrefix: p.PathPrefix,
-		Target:     target.String(),
-		HostHeader: p.HostHeader,
-		OwnerPID:   p.OwnerPID,
-		Ephemeral:  true,
-		Insecure:   p.Insecure,
-		Reuse:      p.Reuse,
-		Replace:    p.Replace,
-		TTL:        d.cfg.Defaults.LeaseTTL,
+		Hostname:       p.Hostname,
+		PathPrefix:     p.PathPrefix,
+		Target:         target.String(),
+		HostHeader:     p.HostHeader,
+		OwnerPID:       p.OwnerPID,
+		OwnerStartTime: ownerStartTime(p),
+		Ephemeral:      true,
+		Insecure:       p.Insecure,
+		Reuse:          p.Reuse,
+		Replace:        p.Replace,
+		TTL:            d.cfg.Defaults.LeaseTTL,
 	})
 	if err != nil {
+		if !tunnelWasRunning {
+			cleanupErr := d.StopTunnel()
+			d.scheduleIdleIfUnused()
+			return leases.Lease{}, errors.Join(err, cleanupErr)
+		}
+		d.scheduleIdleIfUnused()
 		return leases.Lease{}, err
 	}
 	d.cancelIdle()
 	return l, nil
+}
+
+func ownerStartTime(p rpc.AcquireParams) int64 {
+	if p.OwnerStartTime > 0 {
+		return p.OwnerStartTime
+	}
+	startTime, err := procutil.StartTime(p.OwnerPID)
+	if err != nil {
+		return 0
+	}
+	return startTime
 }
 
 func (d *Daemon) RenewLease(id, token string) (leases.Lease, error) {
@@ -225,11 +291,29 @@ func (d *Daemon) Profile() string {
 
 func (d *Daemon) StartTunnel() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	ctx := d.runCtx
+	d.mu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	return d.startTunnel(ctx)
+}
+
+// StartTunnelContext lets the RPC server cancel an in-flight tunnel startup
+// while it drains requests during daemon shutdown.
+func (d *Daemon) StartTunnelContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return d.startTunnel(ctx)
+}
+
+func (d *Daemon) startTunnel(ctx context.Context) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Reuse only if still alive AND edge-ready (deleted tunnels can leave a living but broken process).
@@ -243,8 +327,9 @@ func (d *Daemon) StartTunnel() error {
 		if aliveAndReady {
 			return nil
 		}
-		_ = d.cfProc.Stop(3 * time.Second)
-		d.cfProc = nil
+		if err := d.stopTunnelLocked(3 * time.Second); err != nil {
+			return err
+		}
 	}
 
 	prof, err := d.cfg.Profile(d.profile)
@@ -252,7 +337,11 @@ func (d *Daemon) StartTunnel() error {
 		return err
 	}
 	if !prof.IsConfigured() {
-		return apperr.New(apperr.ExitInvalidArgs, "Custom hostnames require one-time setup.\n\nRun:\n  portx setup\n\nFor an immediate random URL:\n  portx http 3000")
+		return apperr.New(
+			apperr.ExitInvalidArgs,
+			"Custom hostnames require one-time setup.\n\nRun:\n  portx setup\n\n"+
+				"For an immediate random URL:\n  portx http 3000",
+		)
 	}
 	store, err := credentials.Open()
 	if err != nil {
@@ -271,7 +360,8 @@ func (d *Daemon) StartTunnel() error {
 		cancel()
 		if gerr != nil {
 			return apperr.New(apperr.ExitCloudflared, fmt.Sprintf(
-				"Cloudflare tunnel %s is missing or inaccessible.\n\nIt may have been deleted in the dashboard.\n\nFix:\n  portx setup",
+				"Cloudflare tunnel %s is missing or inaccessible.\n\n"+
+					"It may have been deleted in the dashboard.\n\nFix:\n  portx setup",
 				prof.TunnelID))
 		}
 		if t.DeletedAt != nil && *t.DeletedAt != "" {
@@ -292,27 +382,68 @@ func (d *Daemon) StartTunnel() error {
 	if err != nil {
 		return err
 	}
+	d.cfProc = proc
+	pidPath := filepath.Join(d.runtimeDir, "cloudflared.pid")
+	if err := persistPIDRecord(pidPath, proc.PID(), st.Path, "cloudflared"); err != nil {
+		stopErr := d.stopTunnelLocked(3 * time.Second)
+		return errors.Join(fmt.Errorf("write cloudflared pid file: %w", err), stopErr)
+	}
 	// Fail faster than before so the CLI spinner doesn't spin forever.
 	readyCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	if err := proc.WaitReady(readyCtx); err != nil {
-		_ = proc.Stop(3 * time.Second)
-		return err
+		return errors.Join(err, d.stopTunnelLocked(3*time.Second))
 	}
-	d.cfProc = proc
-	_ = os.WriteFile(filepath.Join(d.runtimeDir, "cloudflared.pid"), []byte(strconv.Itoa(proc.PID())), 0o600)
 	return nil
+}
+
+func (d *Daemon) tunnelRunning() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cfProc != nil && d.cfProc.Alive()
+}
+
+func (d *Daemon) scheduleIdleIfUnused() {
+	if len(d.leases.List()) == 0 {
+		d.scheduleIdle()
+	}
 }
 
 func (d *Daemon) StopTunnel() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.cfProc != nil {
-		_ = d.cfProc.Stop(10 * time.Second)
-		d.cfProc = nil
+	return d.stopTunnelLocked(10 * time.Second)
+}
+
+func (d *Daemon) StopTunnelContext(ctx context.Context) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
-	_ = os.Remove(filepath.Join(d.runtimeDir, "cloudflared.pid"))
-	return nil
+	return d.StopTunnel()
+}
+
+func (d *Daemon) stopTunnelLocked(timeout time.Duration) error {
+	if d.cfProc == nil {
+		pidPath := filepath.Join(d.runtimeDir, "cloudflared.pid")
+		if _, err := os.Stat(pidPath); err == nil {
+			return fmt.Errorf("cloudflared pid file exists without a tracked process")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	proc := d.cfProc
+	stopErr := proc.Stop(timeout)
+	if proc.Alive() {
+		if stopErr == nil {
+			return fmt.Errorf("cloudflared is still running")
+		}
+		return fmt.Errorf("cloudflared is still running: %w", stopErr)
+	}
+	d.cfProc = nil
+	return errors.Join(stopErr, removeIfPresent(filepath.Join(d.runtimeDir, "cloudflared.pid")))
 }
 
 func (d *Daemon) scheduleIdle() {
@@ -338,10 +469,10 @@ func (d *Daemon) scheduleIdle() {
 			return
 		}
 		if d.cfProc != nil {
-			_ = d.cfProc.Stop(10 * time.Second)
-			d.cfProc = nil
+			if err := d.stopTunnelLocked(10 * time.Second); err != nil {
+				log.Printf("portx: idle cloudflared shutdown failed: %v", err)
+			}
 		}
-		_ = os.Remove(filepath.Join(d.runtimeDir, "cloudflared.pid"))
 	})
 }
 
@@ -353,4 +484,92 @@ func (d *Daemon) cancelIdle() {
 		d.idleStop.Stop()
 		d.idleStop = nil
 	}
+}
+
+type pidRecord struct {
+	PID        int    `json:"pid"`
+	Executable string `json:"executable"`
+	Kind       string `json:"kind"`
+	StartTime  int64  `json:"start_time"`
+}
+
+func newPIDRecord(pid int, executable, kind string) (pidRecord, error) {
+	if pid <= 0 || executable == "" || kind == "" {
+		return pidRecord{}, fmt.Errorf("invalid pid record")
+	}
+	startTime, err := processStartTime(pid)
+	if err != nil {
+		return pidRecord{}, fmt.Errorf("get process start time: %w", err)
+	}
+	return pidRecord{
+		PID:        pid,
+		Executable: executable,
+		Kind:       kind,
+		StartTime:  startTime,
+	}, nil
+}
+
+func persistPIDRecord(path string, pid int, executable, kind string) error {
+	record, err := newPIDRecord(pid, executable, kind)
+	if err != nil {
+		return err
+	}
+	return writePIDRecord(path, record)
+}
+
+func writePIDRecord(path string, record pidRecord) error {
+	if record.PID <= 0 || record.Executable == "" || record.Kind == "" || record.StartTime <= 0 {
+		return fmt.Errorf("invalid pid record")
+	}
+	b, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	defer os.Remove(tmp)
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func removeIfPresent(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func processStartTime(pid int) (int64, error) {
+	if pid <= 0 {
+		return 0, os.ErrInvalid
+	}
+	if runtime.GOOS == "windows" {
+		command := fmt.Sprintf(
+			"$p=Get-Process -Id %d -ErrorAction Stop; $p.StartTime.ToUniversalTime().ToString('o')",
+			pid,
+		)
+		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", command).Output()
+		if err != nil {
+			return 0, err
+		}
+		started, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(out)))
+		if err != nil {
+			return 0, err
+		}
+		return started.UnixNano(), nil
+	}
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	if err != nil {
+		return 0, err
+	}
+	started, err := time.ParseInLocation(
+		"Mon Jan _2 15:04:05 2006",
+		strings.TrimSpace(string(out)),
+		time.Local,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return started.UnixNano(), nil
 }

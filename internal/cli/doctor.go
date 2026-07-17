@@ -20,8 +20,8 @@ import (
 
 func doctorCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "doctor",
-		Usage: "Diagnose common PortX problems",
+		Name:   "doctor",
+		Usage:  "Diagnose common PortX problems",
 		Action: runDoctor,
 	}
 }
@@ -116,7 +116,11 @@ func checkProfile(ctx context.Context, r *doctorReport, cmd *cli.Command, cfg co
 	if !r.check("credential store", err) {
 		return
 	}
-	r.ok("credential store (%s)", store.Backend())
+	if store.Backend() == "file (plaintext)" {
+		r.warn("credential store uses plaintext files; use an OS credential service when possible")
+	} else {
+		r.ok("credential store (%s)", store.Backend())
+	}
 	_, err = store.Get(credentials.TunnelTokenKey(profile))
 	r.check("tunnel token", err)
 	apiTok, err := store.Get(credentials.APITokenKey(profile))

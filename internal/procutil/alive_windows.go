@@ -3,7 +3,11 @@
 package procutil
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
+	"strings"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -43,4 +47,31 @@ func Kill(pid int) error {
 	}
 	defer windows.CloseHandle(h)
 	return windows.TerminateProcess(h, 1)
+}
+
+// StartTime returns the process start time used to detect PID reuse.
+func StartTime(pid int) (int64, error) {
+	if pid <= 0 {
+		return 0, os.ErrInvalid
+	}
+
+	command := fmt.Sprintf(
+		"$p=Get-Process -Id %d -ErrorAction Stop; $p.StartTime.ToUniversalTime().ToString('o')",
+		pid,
+	)
+	out, err := exec.Command(
+		"powershell",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		command,
+	).Output()
+	if err != nil {
+		return 0, err
+	}
+	started, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse process start time: %w", err)
+	}
+	return started.UnixNano(), nil
 }

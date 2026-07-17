@@ -40,9 +40,9 @@ func (w *wincredStore) Set(key, value string) error {
 		pBlob = &blob[0]
 	}
 	cred := credWrite{
-		Flags:      0,
-		Type:       credTypeGeneric,
-		TargetName: target,
+		Flags:              0,
+		Type:               credTypeGeneric,
+		TargetName:         target,
 		CredentialBlobSize: uint32(len(blob)),
 		CredentialBlob:     pBlob,
 		Persist:            credPersistLocalMachine, // user logon sessions on this machine
@@ -94,11 +94,11 @@ func (w *wincredStore) Delete(key string) error {
 }
 
 var (
-	modadvapi32      = syscall.NewLazyDLL("advapi32.dll")
-	procCredWriteW   = modadvapi32.NewProc("CredWriteW")
-	procCredReadW    = modadvapi32.NewProc("CredReadW")
-	procCredDeleteW  = modadvapi32.NewProc("CredDeleteW")
-	procCredFree     = modadvapi32.NewProc("CredFree")
+	modadvapi32     = syscall.NewLazyDLL("advapi32.dll")
+	procCredWriteW  = modadvapi32.NewProc("CredWriteW")
+	procCredReadW   = modadvapi32.NewProc("CredReadW")
+	procCredDeleteW = modadvapi32.NewProc("CredDeleteW")
+	procCredFree    = modadvapi32.NewProc("CredFree")
 )
 
 const (
@@ -140,4 +140,3 @@ type filetime struct {
 	LowDateTime  uint32
 	HighDateTime uint32
 }
-

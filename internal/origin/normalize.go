@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"portx/internal/apperr"
 )
@@ -14,6 +15,9 @@ func Normalize(target string) (*url.URL, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return nil, apperr.New(apperr.ExitInvalidArgs, "target is required")
+	}
+	if strings.IndexFunc(target, unicode.IsControl) >= 0 {
+		return nil, apperr.New(apperr.ExitInvalidArgs, "target contains control characters")
 	}
 
 	if port, err := strconv.Atoi(target); err == nil {
@@ -46,6 +50,15 @@ func Normalize(target string) (*url.URL, error) {
 	}
 	if u.Host == "" {
 		return nil, apperr.New(apperr.ExitInvalidArgs, "target host is required")
+	}
+	if u.User != nil {
+		return nil, apperr.New(apperr.ExitInvalidArgs, "target URLs must not include username or password")
+	}
+	if err := ValidateHostHeader(u.Host); err != nil {
+		return nil, apperr.Wrap(apperr.ExitInvalidArgs, "validate target host", err)
+	}
+	if u.Fragment != "" {
+		return nil, apperr.New(apperr.ExitInvalidArgs, "target URLs must not include fragments")
 	}
 	return u, nil
 }

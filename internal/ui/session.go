@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -235,15 +236,29 @@ func SetError(p *tea.Program, err error) {
 // RunSession runs the dashboard. bootstrap performs connect work and should call
 // SetPhase / SetReady / SetError. After ready, onTick is called every interval
 // until the user quits (for lease renewal).
-func RunSession(bootstrap func(p *tea.Program) error, onTick func() error, tickEvery time.Duration) error {
+func RunSession(ctx context.Context, bootstrap func(context.Context, *tea.Program) error, onTick func() error, tickEvery time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	m := NewConnectingSession("Starting…")
 	p := tea.NewProgram(m)
 
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
+	uiDone := make(chan struct{})
+	go func() {
+		select {
+		case <-sessionCtx.Done():
+			p.Quit()
+		case <-uiDone:
+		}
+	}()
 
 	go func() {
-		err := bootstrap(p)
+		err := bootstrap(sessionCtx, p)
 		if err != nil {
 			SetError(p, err)
 			errCh <- err
@@ -274,6 +289,8 @@ func RunSession(bootstrap func(p *tea.Program) error, onTick func() error, tickE
 	}()
 
 	finalModel, runErr := p.Run()
+	close(uiDone)
+	cancel()
 	close(done)
 	bootErr := <-errCh
 

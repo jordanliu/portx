@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -99,15 +100,15 @@ func runStartTUI(opts startOpts) error {
 	var held []heldRoute
 	var client *rpc.Client
 
-	err := ui.RunSession(func(p *tea.Program) error {
+	err := ui.RunSession(opts.ctx, func(sessionCtx context.Context, p *tea.Program) error {
 		ui.SetPhase(p, "Starting local daemon")
 		var err error
-		client, err = daemon.EnsureRunning(opts.profileName)
+		client, err = daemon.EnsureRunning(sessionCtx, opts.profileName)
 		if err != nil {
 			return apperr.Wrap(apperr.ExitDaemon, "start daemon", err)
 		}
 		ui.SetPhase(p, "Connecting Cloudflare tunnel")
-		if err := client.StartTunnel(); err != nil {
+		if err := client.StartTunnelContext(sessionCtx); err != nil {
 			return err
 		}
 
@@ -149,12 +150,12 @@ func runStartTUI(opts startOpts) error {
 }
 
 func runStartJSON(opts startOpts) error {
-	client, err := daemon.EnsureRunning(opts.profileName)
+	client, err := daemon.EnsureRunning(opts.ctx, opts.profileName)
 	if err != nil {
 		return apperr.Wrap(apperr.ExitDaemon, "start daemon", err)
 	}
 	defer client.Close()
-	if err := client.StartTunnel(); err != nil {
+	if err := client.StartTunnelContext(opts.ctx); err != nil {
 		return err
 	}
 
@@ -207,7 +208,13 @@ func runStartJSON(opts startOpts) error {
 
 func registerProjectRoutes(opts startOpts, client *rpc.Client, onRoute func(string)) ([]heldRoute, error) {
 	held := make([]heldRoute, 0)
-	for name, route := range opts.pc.Routes {
+	names := make([]string, 0, len(opts.pc.Routes))
+	for name := range opts.pc.Routes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		route := opts.pc.Routes[name]
 		if len(opts.only) > 0 && !opts.only[name] {
 			continue
 		}

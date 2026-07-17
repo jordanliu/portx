@@ -28,6 +28,7 @@ Run multiple local services through one tunnel, save routes in your repository, 
   - [Install](#install)
   - [Quick tunnels](#quick-tunnels)
   - [Custom hostnames](#custom-hostnames)
+    - [Multiple domains and profiles](#multiple-domains-and-profiles)
   - [PortX vs. cloudflared](#portx-vs-cloudflared)
   - [Project routes](#project-routes)
   - [Commands](#commands)
@@ -37,9 +38,7 @@ Run multiple local services through one tunnel, save routes in your repository, 
     - [`portx list` / `stop`](#portx-list--stop)
     - [Other commands](#other-commands)
   - [Security and limitations](#security-and-limitations)
-  - [Releases and Homebrew](#releases-and-homebrew)
   - [Troubleshooting](#troubleshooting)
-  - [Development](#development)
   - [License](#license)
 
 ## Install
@@ -100,10 +99,6 @@ the tunnel and **Zone Resources** to the zone PortX will configure. PortX first
 lists the accounts and zones visible to the token, then creates the tunnel and
 wildcard DNS record. An active token with no selected account resources will
 verify successfully but will return no accounts.
-
-Do not paste a global API key or an account token. Use a user API token created
-from your Cloudflare profile at
-[`dash.cloudflare.com/profile/api-tokens`](https://dash.cloudflare.com/profile/api-tokens).
 
 Run the one-time setup:
 
@@ -278,17 +273,17 @@ portx http --url=api 3000 --save --name api
 portx http 3000 --json
 ```
 
-| Flag                     | Description                                                   |
-| ------------------------ | ------------------------------------------------------------- |
+| Flag                     | Description                                                          |
+| ------------------------ | -------------------------------------------------------------------- |
 | `--url`                  | Managed mode. No value → repo/folder name; `api` → `api.<namespace>` |
-| `--save`                 | Save the managed route to `portx.yaml`                        |
-| `--name`                 | Name used when saving the route                               |
-| `--json`                 | Print status as JSON and keep the session open until `Ctrl+C` |
-| `--replace`, `--reuse`   | Control what happens when the hostname is already leased      |
-| `--host-header`          | Override the `Host` header sent to the local origin           |
-| `--scheme`               | Use `http` or `https` for the local origin                    |
-| `--no-origin-check`      | Skip the check for a listening local service                  |
-| `--insecure-skip-verify` | Allow an HTTPS origin with an invalid certificate             |
+| `--save`                 | Save the managed route to `portx.yaml`                               |
+| `--name`                 | Name used when saving the route                                      |
+| `--json`                 | Print status as JSON and keep the session open until terminated      |
+| `--replace`, `--reuse`   | Control what happens when the hostname is already leased             |
+| `--host-header`          | Override the `Host` header sent to the local origin                  |
+| `--scheme`               | Use `http` or `https` for the local origin                           |
+| `--no-origin-check`      | Skip the check for a listening local service                         |
+| `--insecure-skip-verify` | Allow an HTTPS origin with an invalid certificate                    |
 
 Saving a route requires `--url`, `--save`, and `--name`.
 
@@ -361,8 +356,8 @@ portx stop <lease-id-prefix>
 | `portx daemon status`       | Show the status of the local managed-mode daemon                            |
 | `portx daemon stop`         | Stop the local daemon                                                       |
 | `portx cloudflared version` | Show the resolved `cloudflared` binary and version                          |
-| `portx cloudflared install` | Show installation guidance for `cloudflared`                              |
-| `portx cloudflared update`  | Show upgrade guidance for `cloudflared`                                   |
+| `portx cloudflared install` | Show installation guidance for `cloudflared`                                |
+| `portx cloudflared update`  | Show upgrade guidance for `cloudflared`                                     |
 
 The daemon starts automatically when managed mode needs it.
 
@@ -420,37 +415,6 @@ portx --log-level debug http 3000
 | Unexpected local state                         | Run `portx doctor`, then `portx cleanup --force`                           |
 
 Use `portx cleanup --force` only when diagnostics indicate stale local runtime state.
-
-## Releases and Homebrew
-
-Pushing a tag named `vMAJOR.MINOR.PATCH` starts the release workflow. The tag must point to a clean commit reachable from `main`. Before publishing, it runs formatting, workflow linting, tests, race tests, vet, static analysis, vulnerability scanning, and module verification, plus native smoke tests on Linux, macOS, and Windows. It then builds macOS, Linux, and Windows binaries, publishes a reproducible source archive, and uploads `SHA256SUMS` with hashes for every release artifact.
-
-The same workflow validates the published source archive and opens or updates a pull request in [`jordanliu/homebrew-portx`](https://github.com/jordanliu/homebrew-portx). The workflow reports release readiness only after it confirms either an exact merged formula update or exactly one open tap PR. Homebrew availability still follows that pull request; the PR must merge before the formula is installable.
-
-To enable automatic tap updates, configure a repository secret named `HOMEBREW_TAP_TOKEN`. It must be a fine-grained token scoped only to `jordanliu/homebrew-portx` with repository contents read/write and pull request read/write access. A classic token requires the equivalent `repo` access. If the secret is missing or under-scoped, the release artifacts can still publish, but the Homebrew job will fail and report the tap update as incomplete.
-
-For direct downloads, verify the artifact before use:
-
-```bash
-sha256sum -c SHA256SUMS
-# macOS: shasum -a 256 -c SHA256SUMS
-```
-
-Release integrity status: PortX currently publishes checksums, but does not yet publish cryptographic signatures, an SBOM, or SLSA/in-toto provenance attestations. Treat direct-download artifacts as checksum-verified but not independently signed until those controls are added. Homebrew builds from the source archive after the tap formula PR updates its release URL and SHA256; the pre-release tap formula intentionally contains a placeholder SHA and is not installable until the first real release PR is merged.
-
-The Homebrew formula is maintained in the tap repository, not in this source repository.
-
-## Development
-
-```bash
-make format-check
-make workflow-check
-make test
-make vet
-make staticcheck
-make vulncheck
-make build
-```
 
 ## License
 

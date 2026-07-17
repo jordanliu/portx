@@ -36,5 +36,8 @@ func readSecretFile(path string) ([]byte, error) {
 	if handleInfo.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return nil, fmt.Errorf("credential path is a reparse point: %q", path)
 	}
+	if err := securePrivatePath(path, 0o600); err != nil {
+		return nil, err
+	}
 	return io.ReadAll(file)
 }

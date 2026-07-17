@@ -33,12 +33,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -81,13 +81,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -131,11 +131,13 @@ jobs:
           fi
 
           VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
-          echo "source_date_epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "tag=$GITHUB_REF_NAME"
+            echo "commit=$(git rev-parse --short HEAD)"
+            echo "date=$(git show -s --format=%cI HEAD)"
+            echo "source_date_epoch=$(git show -s --format=%ct HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build release binaries
         id: dist
@@ -195,7 +197,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: PortX ${{ steps.meta.outputs.version }}
@@ -233,7 +235,7 @@ jobs:
           fi
 
       - name: Checkout Homebrew tap
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ env.TAP_REPOSITORY }}
           ref: main
@@ -359,11 +361,11 @@ jobs:
 
           pr_count="$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --state open --json number --jq 'length')"
           if [[ "$pr_count" == "0" ]]; then
-            cat > /tmp/portx-homebrew-pr-body <<EOF
-            Updates the PortX Homebrew formula to the ${TAG} release.
-
-            Source archive SHA256: ${SOURCE_SHA256}
-            EOF
+            printf '%s\n' \
+              "Updates the PortX Homebrew formula to the ${TAG} release." \
+              "" \
+              "Source archive SHA256: ${SOURCE_SHA256}" \
+              > /tmp/portx-homebrew-pr-body
 
             gh pr create \
               --repo "$TAP_REPOSITORY" \
@@ -400,9 +402,9 @@ jobs:
           {
             echo "## Homebrew tap automation"
             echo ""
-            echo "Repository: \\`${TAP_REPOSITORY}\\`"
-            echo "Release: \\`${{ needs.release.outputs.tag }}\\`"
-            echo "Tap status: \\`${{ steps.tap.outputs.tap_status }}\\`"
+            printf 'Repository: `%s`\n' "$TAP_REPOSITORY"
+            printf 'Release: `%s`\n' "${{ needs.release.outputs.tag }}"
+            printf 'Tap status: `%s`\n' "${{ steps.tap.outputs.tap_status }}"
             if [[ -n "${{ steps.tap.outputs.pr_url }}" ]]; then
               echo "Tap PR: ${{ steps.tap.outputs.pr_url }}"
             fi

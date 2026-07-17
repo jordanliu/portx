@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -401,6 +402,9 @@ func TestReconcileChecksOwnerStartTime(t *testing.T) {
 }
 
 func TestManagerReportsLeasePurgeFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permission bits do not prevent deletion on Windows")
+	}
 	t.Parallel()
 	storeDir := t.TempDir()
 	path := filepath.Join(storeDir, "stale.json")

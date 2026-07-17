@@ -28,8 +28,10 @@ func TestProjectSaveLoadValidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mode := info.Mode().Perm(); mode != 0o600 {
-		t.Fatalf("project config mode = %o, want 600", mode)
+	if runtime.GOOS != "windows" {
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Fatalf("project config mode = %o, want 600", mode)
+		}
 	}
 	loaded, err := LoadProject(path)
 	if err != nil {
@@ -115,8 +117,11 @@ func TestLoadProjectRejectsUnknownFields(t *testing.T) {
 
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
-	configHome := filepath.Join(home, "Library", "Application Support", "portx")
+	setTestUserDirectories(t, home)
+	configHome, err := ConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(configHome, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -127,4 +132,17 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	if _, err := Load(); err == nil {
 		t.Fatal("expected unknown config field to be rejected")
 	}
+}
+
+func setTestUserDirectories(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	t.Setenv("AppData", filepath.Join(home, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	t.Setenv("LocalAppData", filepath.Join(home, "AppData", "Local"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".state"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 }

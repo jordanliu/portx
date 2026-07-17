@@ -8,7 +8,7 @@ import (
 
 func TestRemoveBrowserCredentials(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	dir := filepath.Join(home, ".cloudflared")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestRemoveBrowserCredentials(t *testing.T) {
 
 func TestRemoveBrowserCredentialsRejectsSymlinkedDirectory(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	target := t.TempDir()
 	if err := os.Symlink(target, filepath.Join(home, ".cloudflared")); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
@@ -46,4 +46,10 @@ func TestRemoveBrowserCredentialsRejectsSymlinkedDirectory(t *testing.T) {
 	if err := RemoveBrowserCredentials(); err == nil {
 		t.Fatal("expected symlinked cloudflared directory to be rejected")
 	}
+}
+
+func setTestHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 }

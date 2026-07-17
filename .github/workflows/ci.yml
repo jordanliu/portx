@@ -56,7 +56,7 @@ jobs:
           ./bin/portx help >/dev/null
 
   quality:
-    name: Quality and security
+    name: Quality and Security
     runs-on: ubuntu-latest
     timeout-minutes: 15
 

@@ -12,7 +12,7 @@ func Open() (Store, error) {
 	}
 	s, err := openSecretService()
 	if err != nil {
-		return nil, fmt.Errorf("Linux Secret Service unavailable: %w\n\nInstall gnome-keyring/libsecret and secret-tool, or set PORTX_CREDENTIALS_FILE=1", err)
+		return nil, fmt.Errorf("linux secret service unavailable: %w\n\ninstall gnome-keyring/libsecret and secret-tool, or set PORTX_CREDENTIALS_FILE=1", err)
 	}
 	return s, nil
 }

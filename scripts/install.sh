@@ -16,8 +16,8 @@ fi
 echo "==> Tapping ${TAP}"
 brew tap "${TAP}" 2>/dev/null || brew tap "${TAP}"
 
-echo "==> Installing ${FORMULA} (includes cloudflared)"
-brew install "${FORMULA}"
+echo "==> Installing ${TAP}/${FORMULA} (includes cloudflared)"
+brew install --formula "${TAP}/${FORMULA}"
 
 echo
 echo "Installed:"

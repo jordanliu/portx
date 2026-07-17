@@ -12,14 +12,16 @@ import (
 
 	"portx/internal/apperr"
 	"portx/internal/leases"
+	"portx/internal/router"
 )
 
 type Client struct {
-	conn net.Conn
-	enc  *json.Encoder
-	dec  *json.Decoder
-	auth string
-	mu   sync.Mutex
+	conn     net.Conn
+	sockPath string
+	enc      *json.Encoder
+	dec      *json.Decoder
+	auth     string
+	mu       sync.Mutex
 }
 
 const (
@@ -37,10 +39,11 @@ func Dial(sockPath string) (*Client, error) {
 		return nil, apperr.Wrap(apperr.ExitDaemon, "connect to daemon", err)
 	}
 	return &Client{
-		conn: conn,
-		enc:  json.NewEncoder(conn),
-		dec:  json.NewDecoder(conn),
-		auth: auth,
+		conn:     conn,
+		sockPath: sockPath,
+		enc:      json.NewEncoder(conn),
+		dec:      json.NewDecoder(conn),
+		auth:     auth,
 	}, nil
 }
 
@@ -48,6 +51,75 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conn.Close()
+}
+
+func (c *Client) SubscribeRequestEvents(
+	ctx context.Context,
+	routeID string,
+	fn func(router.RequestEvent),
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stream, err := Dial(c.sockPath)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = stream.conn.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	if err := stream.conn.SetWriteDeadline(time.Now().Add(rpcClientWriteTimeout)); err != nil {
+		return err
+	}
+	if err := stream.enc.Encode(Request{
+		Version: Version,
+		Method:  "SubscribeRequestEvents",
+		Params:  map[string]any{"route_id": routeID},
+		Auth:    stream.auth,
+	}); err != nil {
+		return apperr.Wrap(apperr.ExitDaemon, "subscribe request events", err)
+	}
+	_ = stream.conn.SetWriteDeadline(time.Time{})
+
+	var ack Response
+	if err := stream.dec.Decode(&ack); err != nil {
+		return apperr.Wrap(apperr.ExitDaemon, "read request event subscription", err)
+	}
+	if !ack.OK {
+		code := ack.Code
+		if code == 0 {
+			code = apperr.ExitDaemon
+		}
+		return apperr.New(code, ack.Error)
+	}
+	if fn == nil {
+		return nil
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var event StreamEvent
+		if err := stream.dec.Decode(&event); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return apperr.Wrap(apperr.ExitDaemon, "read request event", err)
+		}
+		if event.Type == "request" {
+			fn(event.Event)
+		}
+	}
 }
 
 func (c *Client) call(method string, params map[string]any) (map[string]any, error) {

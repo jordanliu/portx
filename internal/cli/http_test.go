@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"portx/internal/rpc"
 )
 
 func TestNewOriginProxyStripsForwardingHeaders(t *testing.T) {
@@ -83,5 +85,15 @@ func TestReportSavedRouteJSONUsesStderr(t *testing.T) {
 	}
 	if !strings.Contains(string(stderr), "saved route") {
 		t.Fatalf("stderr = %q, want save status", stderr)
+	}
+}
+
+func TestValidateRequestEventsStatusRejectsOlderDaemon(t *testing.T) {
+	err := validateRequestEventsStatus(rpc.StatusResult{})
+	if err == nil || !strings.Contains(err.Error(), "portx daemon stop") {
+		t.Fatalf("validation error = %v, want daemon restart guidance", err)
+	}
+	if err := validateRequestEventsStatus(rpc.StatusResult{RequestEvents: true}); err != nil {
+		t.Fatalf("current daemon was rejected: %v", err)
 	}
 }

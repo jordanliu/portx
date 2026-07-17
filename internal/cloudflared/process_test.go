@@ -4,7 +4,9 @@ package cloudflared
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -136,6 +138,123 @@ func TestStartUsesEphemeralMetricsPort(t *testing.T) {
 	}
 }
 
+func TestWaitQuickDNSRetriesTransientNXDOMAIN(t *testing.T) {
+	p := &Process{done: make(chan struct{})}
+	resolver := &sequenceResolver{
+		errors: []error{
+			&net.DNSError{Err: "no such host", IsNotFound: true},
+			nil,
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	if err := p.waitQuickDNS(ctx, resolver, "example.trycloudflare.com"); err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 2 {
+		t.Fatalf("DNS lookup calls = %d, want 2", resolver.calls)
+	}
+}
+
+func TestQuickTunnelHostnameRejectsMissingHostname(t *testing.T) {
+	_, err := quickTunnelHostname("not-a-url")
+	if err == nil || !strings.Contains(err.Error(), "has no hostname") {
+		t.Fatalf("quickTunnelHostname error = %v, want missing hostname error", err)
+	}
+}
+
+func TestDoHHostnameResolverReturnsAddressRecords(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("name"); got != "example.trycloudflare.com" {
+			t.Errorf("DNS query name = %q", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/dns-json" {
+			t.Errorf("Accept header = %q", got)
+		}
+		_, _ = io.WriteString(w, `{"Status":0,"Answer":[{"type":1,"data":"192.0.2.10"}]}`)
+	}))
+	defer server.Close()
+
+	resolver := dohHostnameResolver{client: server.Client(), endpoint: server.URL}
+	addresses, err := resolver.LookupHost(context.Background(), "example.trycloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) != 1 || addresses[0] != "192.0.2.10" {
+		t.Fatalf("addresses = %v, want [192.0.2.10]", addresses)
+	}
+}
+
+func TestFallbackResolverDoesNotCacheDoHNXDOMAINLocally(t *testing.T) {
+	primary := &sequenceResolver{errors: []error{
+		&net.DNSError{Err: "no such host", IsNotFound: true},
+	}}
+	fallback := &sequenceResolver{errors: []error{nil}}
+	resolver := fallbackHostnameResolver{primary: primary, fallback: fallback}
+
+	_, err := resolver.LookupHost(context.Background(), "example.trycloudflare.com")
+	if err == nil {
+		t.Fatal("expected NXDOMAIN error")
+	}
+	if fallback.calls != 0 {
+		t.Fatalf("fallback DNS calls = %d, want 0", fallback.calls)
+	}
+}
+
+func TestFallbackResolverUsesSystemResolverAfterDoHTransportFailure(t *testing.T) {
+	primary := &sequenceResolver{errors: []error{errors.New("HTTPS unavailable")}}
+	fallback := &sequenceResolver{errors: []error{nil}}
+	resolver := fallbackHostnameResolver{primary: primary, fallback: fallback}
+
+	addresses, err := resolver.LookupHost(context.Background(), "example.trycloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) != 1 || fallback.calls != 1 {
+		t.Fatalf("addresses = %v, fallback calls = %d", addresses, fallback.calls)
+	}
+}
+
+func TestFallbackResolverReservesTimeForSystemDNS(t *testing.T) {
+	primary := blockingResolver{}
+	fallback := &sequenceResolver{errors: []error{nil}}
+	resolver := fallbackHostnameResolver{
+		primary:         primary,
+		fallback:        fallback,
+		primaryTimeout:  10 * time.Millisecond,
+		fallbackTimeout: 100 * time.Millisecond,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	addresses, err := resolver.LookupHost(ctx, "example.trycloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) != 1 || fallback.calls != 1 {
+		t.Fatalf("addresses = %v, fallback calls = %d", addresses, fallback.calls)
+	}
+}
+
+func TestAnyResolverAcceptsFirstSuccessfulDNSView(t *testing.T) {
+	stale := &sequenceResolver{errors: []error{
+		&net.DNSError{Err: "no such host", IsNotFound: true},
+	}}
+	ready := &sequenceResolver{errors: []error{nil}}
+	resolver := anyHostnameResolver{
+		resolvers: []hostnameResolver{stale, ready},
+	}
+
+	addresses, err := resolver.LookupHost(context.Background(), "example.trycloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) != 1 || addresses[0] != "192.0.2.1" {
+		t.Fatalf("addresses = %v, want [192.0.2.1]", addresses)
+	}
+}
+
 func containsArgument(args []string, want string) bool {
 	for _, arg := range args {
 		if arg == want {
@@ -147,6 +266,30 @@ func containsArgument(args []string, want string) bool {
 
 type errorCloseReader struct {
 	*strings.Reader
+}
+
+type sequenceResolver struct {
+	errors []error
+	calls  int
+}
+
+type blockingResolver struct{}
+
+func (blockingResolver) LookupHost(ctx context.Context, _ string) ([]string, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (r *sequenceResolver) LookupHost(context.Context, string) ([]string, error) {
+	index := r.calls
+	r.calls++
+	if index >= len(r.errors) {
+		return nil, errors.New("unexpected DNS lookup")
+	}
+	if r.errors[index] != nil {
+		return nil, r.errors[index]
+	}
+	return []string{"192.0.2.1"}, nil
 }
 
 func (r *errorCloseReader) Close() error {

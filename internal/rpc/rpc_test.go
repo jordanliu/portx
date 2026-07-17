@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,23 @@ type blockingContextHandler struct {
 	*testHandler
 	started        chan struct{}
 	acquireStarted chan struct{}
+}
+
+type requestEventHandler struct {
+	*testHandler
+	events          chan router.RequestEvent
+	subscribed      chan struct{}
+	subscribedRoute string
+}
+
+func (h *requestEventHandler) SubscribeRequestEvents(routeID string) (<-chan router.RequestEvent, func()) {
+	h.subscribedRoute = routeID
+	select {
+	case <-h.subscribed:
+	default:
+		close(h.subscribed)
+	}
+	return h.events, func() {}
 }
 
 func (h *blockingContextHandler) StartTunnelContext(ctx context.Context) error {
@@ -112,6 +130,105 @@ func TestRPCRoundTrip(t *testing.T) {
 	}
 	if err := c.ReleaseLease(l.ID, l.OwnerToken); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRPCStreamsRequestEvents(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "events.sock")
+	h := &requestEventHandler{
+		testHandler: &testHandler{m: leases.NewManager(router.NewRegistry(), "", 45*time.Second)},
+		events:      make(chan router.RequestEvent, 1),
+		subscribed:  make(chan struct{}),
+	}
+	srv := NewServer(h)
+	go func() { _ = srv.Serve(sock) }()
+	defer srv.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var c *Client
+	var err error
+	for time.Now().Before(deadline) {
+		c, err = Dial(sock)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	received := make(chan router.RequestEvent, 1)
+	streamErr := make(chan error, 1)
+	go func() {
+		streamErr <- c.SubscribeRequestEvents(ctx, "route-1", func(event router.RequestEvent) {
+			received <- event
+			cancel()
+		})
+	}()
+
+	select {
+	case <-h.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("request event stream did not subscribe")
+	}
+	if h.subscribedRoute != "route-1" {
+		t.Fatalf("subscribed route = %q, want route-1", h.subscribedRoute)
+	}
+	want := router.RequestEvent{
+		RouteID: "route-1",
+		Method:  http.MethodGet,
+		Path:    "/health",
+		Status:  http.StatusOK,
+	}
+	h.events <- want
+	select {
+	case got := <-received:
+		if got.Method != want.Method || got.Path != want.Path || got.Status != want.Status {
+			t.Fatalf("event = %#v, want %#v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for streamed request event")
+	}
+
+	select {
+	case <-streamErr:
+	case <-time.After(time.Second):
+		t.Fatal("request event stream did not stop after cancellation")
+	}
+}
+
+func TestRPCRequestEventStreamRejectsUnsupportedVersion(t *testing.T) {
+	srv := NewServer(&testHandler{
+		m: leases.NewManager(router.NewRegistry(), "", 45*time.Second),
+	})
+	srv.auth = "secret"
+	serverConn, clientConn := net.Pipe()
+	srv.handlers.Add(1)
+	go srv.handle(serverConn)
+	defer func() {
+		_ = clientConn.Close()
+		_ = srv.Close()
+	}()
+
+	if err := json.NewEncoder(clientConn).Encode(Request{
+		Version: Version + 1,
+		Method:  "SubscribeRequestEvents",
+		Params:  map[string]any{"route_id": "route-1"},
+		Auth:    "secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var response Response
+	if err := json.NewDecoder(clientConn).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.OK || response.Error != "unsupported protocol version" {
+		t.Fatalf("response = %+v, want unsupported protocol version", response)
 	}
 }
 

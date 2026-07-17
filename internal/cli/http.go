@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -23,8 +24,14 @@ import (
 	"portx/internal/daemon"
 	"portx/internal/httpx"
 	"portx/internal/origin"
+	"portx/internal/router"
 	"portx/internal/rpc"
 	"portx/internal/ui"
+)
+
+const (
+	quickURLTimeout   = 45 * time.Second
+	quickReadyTimeout = 30 * time.Second
 )
 
 func httpCommand() *cli.Command {
@@ -76,9 +83,22 @@ func runHTTP(ctx context.Context, cmd *cli.Command) error {
 	}
 	if !cmd.Bool("no-origin-check") {
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if err := origin.Preflight(pctx, target); err != nil {
-			return err
+		err := origin.Preflight(pctx, target)
+		cancel()
+		if err != nil {
+			if !ui.IsInteractive() || cmd.Bool("json") {
+				return err
+			}
+			ui.Warn("Could not connect to %q", target.String())
+			ui.Dim("   Nothing is listening on this port yet.")
+			ui.Dim("   Requests will work once your local service starts.")
+			ok, promptErr := ui.Confirm("Start the route anyway?", false)
+			if promptErr != nil {
+				return promptErr
+			}
+			if !ok {
+				return err
+			}
 		}
 	}
 
@@ -198,7 +218,12 @@ func runQuickHTTP(ctx context.Context, cmd *cli.Command, target *url.URL) error 
 			return err
 		}
 
-		handler := newOriginProxy(target, cmd.String("host-header"), cmd.Bool("insecure-skip-verify"))
+		handler := newOriginProxy(
+			target,
+			cmd.String("host-header"),
+			cmd.Bool("insecure-skip-verify"),
+			newUIRequestObserver(sessionCtx, p),
+		)
 		var lerr error
 		ln, lerr = net.Listen("tcp", "127.0.0.1:0")
 		if lerr != nil {
@@ -216,10 +241,16 @@ func runQuickHTTP(ctx context.Context, cmd *cli.Command, target *url.URL) error 
 		}
 
 		ui.SetPhase(p, "Waiting for public URL")
-		waitCtx, cancel := context.WithTimeout(sessionCtx, 45*time.Second)
-		defer cancel()
-		public, err := proc.WaitQuickURL(waitCtx)
+		urlCtx, cancelURL := context.WithTimeout(sessionCtx, quickURLTimeout)
+		public, err := proc.WaitQuickURL(urlCtx)
+		cancelURL()
 		if err != nil {
+			return err
+		}
+		ui.SetPhase(p, "Waiting for Quick Tunnel DNS")
+		readyCtx, cancelReady := context.WithTimeout(sessionCtx, quickReadyTimeout)
+		defer cancelReady()
+		if err := proc.WaitQuickReady(readyCtx, public); err != nil {
 			return err
 		}
 
@@ -274,10 +305,15 @@ func runQuickHTTPJSON(ctx context.Context, cmd *cli.Command, target *url.URL) er
 	}
 	defer func() { _ = proc.Stop(10 * time.Second) }()
 
-	waitCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	public, err := proc.WaitQuickURL(waitCtx)
-	cancel()
+	urlCtx, cancelURL := context.WithTimeout(ctx, quickURLTimeout)
+	public, err := proc.WaitQuickURL(urlCtx)
+	cancelURL()
 	if err != nil {
+		return err
+	}
+	readyCtx, cancelReady := context.WithTimeout(ctx, quickReadyTimeout)
+	defer cancelReady()
+	if err := proc.WaitQuickReady(readyCtx, public); err != nil {
 		return err
 	}
 	enc := json.NewEncoder(os.Stdout)
@@ -331,6 +367,9 @@ func runManagedHTTP(ctx context.Context, cmd *cli.Command, target *url.URL, publ
 		if err != nil {
 			return apperr.Wrap(apperr.ExitDaemon, "start daemon", err)
 		}
+		if err := requireRequestEvents(client); err != nil {
+			return err
+		}
 
 		ui.SetPhase(p, "Connecting Cloudflare tunnel")
 		if err := client.StartTunnelContext(sessionCtx); err != nil {
@@ -363,6 +402,7 @@ func runManagedHTTP(ctx context.Context, cmd *cli.Command, target *url.URL, publ
 			Mode:    "managed",
 			Profile: profileName,
 		})
+		go streamRequestEvents(sessionCtx, client, p, l.RouteID)
 		return nil
 	}, func() error {
 		if client == nil || leaseID == "" {
@@ -446,7 +486,12 @@ func runManagedHTTPJSON(ctx context.Context, cmd *cli.Command, target *url.URL, 
 	}, hbEvery)
 }
 
-func newOriginProxy(target *url.URL, hostHeader string, insecure bool) http.Handler {
+func newOriginProxy(
+	target *url.URL,
+	hostHeader string,
+	insecure bool,
+	observers ...router.RequestObserver,
+) http.Handler {
 	rp := &httputil.ReverseProxy{}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = nil
@@ -477,7 +522,76 @@ func newOriginProxy(target *url.URL, hostHeader string, insecure bool) http.Hand
 		proxyReq.Out.Header.Set("X-PortX-Request-ID", uuid.NewString())
 		proxyReq.Out.Header.Set("X-Forwarded-Proto", "https")
 	}
-	return withRequestBodyIdleTimeout(rp)
+	handler := withRequestBodyIdleTimeout(rp)
+	if len(observers) > 0 {
+		handler = router.ObserveHandler(handler, observers[0])
+	}
+	return handler
+}
+
+func streamRequestEvents(
+	ctx context.Context,
+	client *rpc.Client,
+	p *tea.Program,
+	routeID string,
+) {
+	err := client.SubscribeRequestEvents(ctx, routeID, func(event router.RequestEvent) {
+		ui.AddRequest(p, requestLog(event))
+	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		ui.SetNote(p, fmt.Sprintf("Request logging stopped: %v", err))
+	}
+}
+
+func requireRequestEvents(client *rpc.Client) error {
+	status, err := client.GetStatus()
+	if err != nil {
+		return err
+	}
+	return validateRequestEventsStatus(status)
+}
+
+func validateRequestEventsStatus(status rpc.StatusResult) error {
+	if status.RequestEvents {
+		return nil
+	}
+	return apperr.New(
+		apperr.ExitDaemon,
+		"The running PortX daemon is from an older build.\n\n"+
+			"Restart it, then retry:\n  portx daemon stop",
+	)
+}
+
+func newUIRequestObserver(ctx context.Context, p *tea.Program) router.RequestObserver {
+	const requestBuffer = 64
+	events := make(chan router.RequestEvent, requestBuffer)
+	go func() {
+		for {
+			select {
+			case event := <-events:
+				ui.AddRequest(p, requestLog(event))
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return func(event router.RequestEvent) {
+		select {
+		case events <- event:
+		default:
+		}
+	}
+}
+
+func requestLog(event router.RequestEvent) ui.RequestLog {
+	return ui.RequestLog{
+		Timestamp: event.Timestamp,
+		Method:    event.Method,
+		Path:      event.Path,
+		Status:    event.Status,
+		Duration:  event.Duration,
+		Bytes:     event.Bytes,
+	}
 }
 
 func withRequestBodyIdleTimeout(handler http.Handler) http.Handler {

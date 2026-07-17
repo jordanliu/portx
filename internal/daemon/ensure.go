@@ -35,7 +35,10 @@ func EnsureRunning(ctx context.Context, profile string) (*rpc.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open daemon log: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, self, "--profile", profile, "daemon", "run")
+	// The daemon must outlive the CLI session that started it. Startup
+	// cancellation is handled explicitly below; tying the process to ctx would
+	// force-kill it before its deferred cloudflared cleanup can run.
+	cmd := newDaemonProcess(self, profile)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
@@ -73,6 +76,10 @@ func EnsureRunning(ctx context.Context, profile string) (*rpc.Client, error) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func newDaemonProcess(executable, profile string) *exec.Cmd {
+	return exec.Command(executable, "--profile", profile, "daemon", "run")
 }
 
 func openDaemonLog(path string) (*os.File, error) {

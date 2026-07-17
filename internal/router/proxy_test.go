@@ -49,6 +49,48 @@ func TestProxyForwards(t *testing.T) {
 	}
 }
 
+func TestProxyPublishesRequestEvent(t *testing.T) {
+	t.Parallel()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer origin.Close()
+
+	u, _ := url.Parse(origin.URL)
+	reg := NewRegistry()
+	_ = reg.Add(Route{
+		ID: "1", Hostname: "api.example.dev", PathPrefix: "/",
+		Target: u, CreatedAt: time.Now(),
+	})
+	events := make(chan RequestEvent, 1)
+	p := NewProxy(reg, func(event RequestEvent) { events <- event })
+	req := httptest.NewRequest(http.MethodPost, "http://api.example.dev/hello", strings.NewReader("body"))
+	req.Host = "api.example.dev"
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	select {
+	case event := <-events:
+		if event.RouteID != "1" {
+			t.Fatalf("event route ID = %q, want 1", event.RouteID)
+		}
+		if event.Host != "api.example.dev" || event.Method != http.MethodPost {
+			t.Fatalf("event request = %#v", event)
+		}
+		if event.Path != "/hello" || event.Status != http.StatusOK {
+			t.Fatalf("event response = %#v", event)
+		}
+		if event.Bytes != int64(len("hello")) {
+			t.Fatalf("event bytes = %d, want %d", event.Bytes, len("hello"))
+		}
+		if event.Duration <= 0 {
+			t.Fatal("event duration was not recorded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for request event")
+	}
+}
+
 func TestProxyInactive(t *testing.T) {
 	t.Parallel()
 	p := NewProxy(NewRegistry())

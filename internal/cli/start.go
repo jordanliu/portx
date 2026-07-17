@@ -38,6 +38,7 @@ func startCommand() *cli.Command {
 type heldRoute struct {
 	name      string
 	id        string
+	routeID   string
 	token     string
 	target    string
 	publicURL string
@@ -107,6 +108,9 @@ func runStartTUI(opts startOpts) error {
 		if err != nil {
 			return apperr.Wrap(apperr.ExitDaemon, "start daemon", err)
 		}
+		if err := requireRequestEvents(client); err != nil {
+			return err
+		}
 		ui.SetPhase(p, "Connecting Cloudflare tunnel")
 		if err := client.StartTunnelContext(sessionCtx); err != nil {
 			return err
@@ -128,6 +132,9 @@ func runStartTUI(opts startOpts) error {
 			Profile: opts.profileName,
 			Routes:  routes,
 		})
+		for _, route := range held {
+			go streamRequestEvents(sessionCtx, client, p, route.routeID)
+		}
 		return nil
 	}, func() error {
 		for _, h := range held {
@@ -283,6 +290,7 @@ func acquireProjectRoute(opts startOpts, client *rpc.Client, name string, route 
 	return heldRoute{
 		name:      name,
 		id:        lease.ID,
+		routeID:   lease.RouteID,
 		token:     lease.OwnerToken,
 		target:    target.String(),
 		publicURL: publicURL,

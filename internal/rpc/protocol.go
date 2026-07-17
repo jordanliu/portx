@@ -1,6 +1,9 @@
 package rpc
 
-import "portx/internal/leases"
+import (
+	"portx/internal/leases"
+	"portx/internal/router"
+)
 
 const Version = 1
 
@@ -18,12 +21,18 @@ type Response struct {
 	Result map[string]any `json:"result,omitempty"`
 }
 
+type StreamEvent struct {
+	Type  string              `json:"type"`
+	Event router.RequestEvent `json:"event"`
+}
+
 type StatusResult struct {
 	ProxyAddr      string `json:"proxy_addr"`
 	TunnelRunning  bool   `json:"tunnel_running"`
 	LeaseCount     int    `json:"lease_count"`
 	CloudflaredPID int    `json:"cloudflared_pid,omitempty"`
 	Profile        string `json:"profile,omitempty"`
+	RequestEvents  bool   `json:"request_events"`
 }
 
 type AcquireParams struct {

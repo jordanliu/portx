@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,7 +51,47 @@ type Process struct {
 
 const maxMetricsResponseBytes = 64 << 10
 
+const (
+	quickDNSPollInterval   = time.Second
+	quickDNSPropagationLag = 8 * time.Second
+	quickDNSLookupTimeout  = 5 * time.Second
+	quickDoHLookupTimeout  = 2 * time.Second
+	quickHostLookupTimeout = 2 * time.Second
+)
+
+const (
+	cloudflareDoHEndpoint = "https://cloudflare-dns.com/dns-query"
+	googleDoHEndpoint     = "https://dns.google/resolve"
+)
+
 var metricsClient = &http.Client{Timeout: 2 * time.Second}
+
+var quickTunnelResolver hostnameResolver = fallbackHostnameResolver{
+	primary: anyHostnameResolver{
+		resolvers: []hostnameResolver{
+			dohHostnameResolver{
+				client:   newDoHClient(),
+				endpoint: cloudflareDoHEndpoint,
+			},
+			dohHostnameResolver{
+				client:   newDoHClient(),
+				endpoint: googleDoHEndpoint,
+			},
+		},
+	},
+	fallback:        net.DefaultResolver,
+	primaryTimeout:  quickDoHLookupTimeout,
+	fallbackTimeout: quickHostLookupTimeout,
+}
+
+func newDoHClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	return &http.Client{
+		Transport: transport,
+		Timeout:   2 * time.Second,
+	}
+}
 
 type QuickOptions struct {
 	OriginURL   string
@@ -446,6 +489,252 @@ func (p *Process) WaitReady(ctx context.Context) error {
 			return p.timeoutError("tunnel did not become ready")
 		case <-p.done:
 			return p.exitError("exited before becoming ready")
+		case <-ticker.C:
+		}
+	}
+}
+
+// WaitQuickReady waits until both the cloudflared connector and its generated
+// public hostname are ready. cloudflared can publish a Quick Tunnel URL before
+// the corresponding DNS record is resolvable.
+func (p *Process) WaitQuickReady(ctx context.Context, publicURL string) error {
+	if err := p.WaitReady(ctx); err != nil {
+		return err
+	}
+	hostname, err := quickTunnelHostname(publicURL)
+	if err != nil {
+		return err
+	}
+	if err := p.waitQuickDNSGrace(ctx); err != nil {
+		return err
+	}
+	return p.waitQuickDNS(ctx, quickTunnelResolver, hostname)
+}
+
+func (p *Process) waitQuickDNSGrace(ctx context.Context) error {
+	timer := time.NewTimer(quickDNSPropagationLag)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("wait for quick tunnel DNS propagation: %w", ctx.Err())
+	case <-p.done:
+		return p.exitError("exited before its hostname could propagate")
+	}
+}
+
+type hostnameResolver interface {
+	LookupHost(context.Context, string) ([]string, error)
+}
+
+type fallbackHostnameResolver struct {
+	primary         hostnameResolver
+	fallback        hostnameResolver
+	primaryTimeout  time.Duration
+	fallbackTimeout time.Duration
+}
+
+type anyHostnameResolver struct {
+	resolvers []hostnameResolver
+}
+
+type hostnameResult struct {
+	addresses []string
+	err       error
+}
+
+func (r anyHostnameResolver) LookupHost(
+	ctx context.Context,
+	hostname string,
+) ([]string, error) {
+	if len(r.resolvers) == 0 {
+		return nil, errors.New("no hostname resolvers configured")
+	}
+	lookupCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan hostnameResult, len(r.resolvers))
+	for _, resolver := range r.resolvers {
+		go func() {
+			addresses, err := resolver.LookupHost(lookupCtx, hostname)
+			results <- hostnameResult{addresses: addresses, err: err}
+		}()
+	}
+
+	errorsSeen := make([]error, 0, len(r.resolvers))
+	allNotFound := true
+	for range r.resolvers {
+		result := <-results
+		if result.err == nil && len(result.addresses) > 0 {
+			return result.addresses, nil
+		}
+		errorsSeen = append(errorsSeen, result.err)
+		if !dnsNameNotFound(result.err) {
+			allNotFound = false
+		}
+	}
+	if allNotFound {
+		return nil, &net.DNSError{
+			Err:        "all resolvers returned no such host",
+			Name:       hostname,
+			IsNotFound: true,
+		}
+	}
+	return nil, fmt.Errorf("hostname resolvers failed: %v", errorsSeen)
+}
+
+func (r fallbackHostnameResolver) LookupHost(
+	ctx context.Context,
+	hostname string,
+) ([]string, error) {
+	primaryTimeout := r.primaryTimeout
+	if primaryTimeout <= 0 {
+		primaryTimeout = quickDoHLookupTimeout
+	}
+	fallbackTimeout := r.fallbackTimeout
+	if fallbackTimeout <= 0 {
+		fallbackTimeout = quickHostLookupTimeout
+	}
+
+	primaryCtx, cancelPrimary := context.WithTimeout(ctx, primaryTimeout)
+	addresses, err := r.primary.LookupHost(primaryCtx, hostname)
+	cancelPrimary()
+	if err == nil || dnsNameNotFound(err) {
+		return addresses, err
+	}
+
+	fallbackCtx, cancelFallback := context.WithTimeout(ctx, fallbackTimeout)
+	defer cancelFallback()
+	return r.fallback.LookupHost(fallbackCtx, hostname)
+}
+
+func dnsNameNotFound(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
+}
+
+type dohHostnameResolver struct {
+	client   *http.Client
+	endpoint string
+}
+
+type dohResponse struct {
+	Status int         `json:"Status"`
+	Answer []dohAnswer `json:"Answer"`
+}
+
+type dohAnswer struct {
+	Type int    `json:"type"`
+	Data string `json:"data"`
+}
+
+func (r dohHostnameResolver) LookupHost(
+	ctx context.Context,
+	hostname string,
+) ([]string, error) {
+	endpoint, err := url.Parse(r.endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("parse dns-over-HTTPS endpoint: %w", err)
+	}
+	query := endpoint.Query()
+	query.Set("name", hostname)
+	query.Set("type", "A")
+	endpoint.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/dns-json")
+	req.Close = true
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	body, bodyErr := readMetricsBody(resp)
+	if resp.StatusCode != http.StatusOK {
+		if bodyErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("dns-over-HTTPS returned %s", resp.Status),
+				bodyErr,
+			)
+		}
+		return nil, fmt.Errorf("dns-over-HTTPS returned %s", resp.Status)
+	}
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
+
+	var result dohResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode dns-over-HTTPS response: %w", err)
+	}
+	if result.Status != 0 {
+		return nil, &net.DNSError{
+			Err:        fmt.Sprintf("DNS response status %d", result.Status),
+			Name:       hostname,
+			IsNotFound: result.Status == 3,
+		}
+	}
+	addresses := make([]string, 0, len(result.Answer))
+	for _, answer := range result.Answer {
+		if answer.Type == 1 && net.ParseIP(answer.Data) != nil {
+			addresses = append(addresses, answer.Data)
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, &net.DNSError{
+			Err:        "no address records",
+			Name:       hostname,
+			IsNotFound: true,
+		}
+	}
+	return addresses, nil
+}
+
+func quickTunnelHostname(publicURL string) (string, error) {
+	parsed, err := url.Parse(publicURL)
+	if err != nil {
+		return "", fmt.Errorf("parse Quick Tunnel URL: %w", err)
+	}
+	hostname := parsed.Hostname()
+	if hostname == "" {
+		return "", fmt.Errorf("quick tunnel URL %q has no hostname", publicURL)
+	}
+	return hostname, nil
+}
+
+func (p *Process) waitQuickDNS(
+	ctx context.Context,
+	resolver hostnameResolver,
+	hostname string,
+) error {
+	ticker := time.NewTicker(quickDNSPollInterval)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		lookupCtx, cancel := context.WithTimeout(ctx, quickDNSLookupTimeout)
+		addresses, err := resolver.LookupHost(lookupCtx, hostname)
+		cancel()
+		if err == nil && len(addresses) > 0 {
+			return nil
+		}
+		if err == nil {
+			err = errors.New("dns lookup returned no addresses")
+		}
+		lastErr = err
+		if p.exited.Load() {
+			return p.exitError("exited before its hostname became resolvable")
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf(
+				"quick tunnel hostname %q did not become resolvable: %w",
+				hostname,
+				errors.Join(ctx.Err(), lastErr),
+			)
+		case <-p.done:
+			return p.exitError("exited before its hostname became resolvable")
 		case <-ticker.C:
 		}
 	}

@@ -65,6 +65,11 @@ func Confirm(title string, defaultYes bool) (bool, error) {
 	return c.Value == "yes", nil
 }
 
+// IsInteractive reports whether the process can safely render an interactive prompt.
+func IsInteractive() bool {
+	return isInteractive()
+}
+
 type selectModel struct {
 	title     string
 	choices   []Choice

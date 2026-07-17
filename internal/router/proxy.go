@@ -33,11 +33,17 @@ var forwardingHeaders = []string{
 type Proxy struct {
 	registry  *Registry
 	transport *http.Transport
+	observer  RequestObserver
 }
 
-func NewProxy(reg *Registry) *Proxy {
+func NewProxy(reg *Registry, observers ...RequestObserver) *Proxy {
+	var observer RequestObserver
+	if len(observers) > 0 {
+		observer = observers[0]
+	}
 	return &Proxy{
 		registry: reg,
+		observer: observer,
 		transport: &http.Transport{
 			// Never route origin traffic through HTTP_PROXY (local dev tool).
 			Proxy:                 nil,
@@ -53,6 +59,14 @@ func NewProxy(reg *Registry) *Proxy {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if p.observer != nil {
+		ObserveHandler(http.HandlerFunc(p.serveHTTP), p.observer).ServeHTTP(w, r)
+		return
+	}
+	p.serveHTTP(w, r)
+}
+
+func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	host := normalizeHost(r.Host)
 	path := r.URL.Path
 	if path == "" {
@@ -68,6 +82,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	setObservedRouteID(r, route.ID)
 
 	reqID := uuid.NewString()
 	rp := &httputil.ReverseProxy{}

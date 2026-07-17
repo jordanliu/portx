@@ -33,6 +33,7 @@ type Daemon struct {
 	profile    string
 	reg        *router.Registry
 	leases     *leases.Manager
+	requests   *requestBroker
 	runtimeDir string
 	proxyAddr  string
 
@@ -66,6 +67,7 @@ func New(cfg config.Config, profile string) (*Daemon, error) {
 		profile:    profile,
 		reg:        reg,
 		leases:     m,
+		requests:   newRequestBroker(),
 		runtimeDir: runtimeDir,
 		proxyAddr:  proxyAddr,
 		stopCh:     make(chan struct{}),
@@ -82,6 +84,10 @@ func (d *Daemon) PidPath() string {
 
 func (d *Daemon) LockPath() string {
 	return filepath.Join(d.runtimeDir, "portxd.lock")
+}
+
+func (d *Daemon) SubscribeRequestEvents(routeID string) (<-chan router.RequestEvent, func()) {
+	return d.requests.Subscribe(routeID)
 }
 
 func (d *Daemon) Run(ctx context.Context) (runErr error) {
@@ -103,9 +109,12 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	if err := flockExclusive(lock); err != nil {
 		return apperr.New(apperr.ExitDaemon, "another portx daemon holds the lock")
 	}
+	if err := d.recoverCloudflared(); err != nil {
+		return fmt.Errorf("recover cloudflared from previous daemon: %w", err)
+	}
 
 	// bind proxy
-	proxy := router.NewProxy(d.reg)
+	proxy := router.NewProxy(d.reg, d.requests.Publish)
 	srv, ln, err := router.ListenAndServe(d.proxyAddr, proxy)
 	if err != nil {
 		return apperr.Wrap(apperr.ExitDaemon, fmt.Sprintf("bind proxy on %s", d.proxyAddr), err)
@@ -165,9 +174,10 @@ func (d *Daemon) GetStatus() (rpc.StatusResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	st := rpc.StatusResult{
-		ProxyAddr:  d.proxyAddr,
-		LeaseCount: len(d.leases.List()),
-		Profile:    d.profile,
+		ProxyAddr:     d.proxyAddr,
+		LeaseCount:    len(d.leases.List()),
+		Profile:       d.profile,
+		RequestEvents: true,
 	}
 	if d.cfProc != nil && d.cfProc.Alive() {
 		st.TunnelRunning = true

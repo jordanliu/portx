@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"portx/internal/credentials"
 	"portx/internal/leases"
 	"portx/internal/origin"
+	"portx/internal/router"
 )
 
 const (
@@ -41,6 +43,10 @@ type ContextHandler interface {
 	AcquireLeaseContext(context.Context, AcquireParams) (leases.Lease, error)
 	StartTunnelContext(context.Context) error
 	StopTunnelContext(context.Context) error
+}
+
+type RequestEventHandler interface {
+	SubscribeRequestEvents(string) (<-chan router.RequestEvent, func())
 }
 
 type Server struct {
@@ -136,11 +142,86 @@ func (s *Server) handle(conn net.Conn) {
 			return
 		default:
 		}
+		if req.Method == "SubscribeRequestEvents" {
+			if req.Version != Version {
+				_ = enc.Encode(Response{
+					OK:    false,
+					Code:  apperr.ExitDaemon,
+					Error: "unsupported protocol version",
+				})
+				return
+			}
+			s.handleRequestEventStream(conn, enc, req)
+			return
+		}
 		resp := s.dispatchContext(s.ctx, req)
 		if err := conn.SetWriteDeadline(time.Now().Add(rpcWriteTimeout)); err != nil {
 			return
 		}
 		if err := enc.Encode(resp); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) handleRequestEventStream(
+	conn net.Conn,
+	enc *json.Encoder,
+	req Request,
+) {
+	h, ok := s.handler.(RequestEventHandler)
+	if !ok {
+		_ = enc.Encode(Response{OK: false, Code: apperr.ExitDaemon, Error: "request event stream unavailable"})
+		return
+	}
+	routeID, _ := req.Params["route_id"].(string)
+	if routeID == "" {
+		_ = enc.Encode(Response{
+			OK:    false,
+			Code:  apperr.ExitInvalidArgs,
+			Error: "request event route ID is required",
+		})
+		return
+	}
+	events, unsubscribe := h.SubscribeRequestEvents(routeID)
+	defer unsubscribe()
+	if err := conn.SetWriteDeadline(time.Now().Add(rpcWriteTimeout)); err != nil {
+		return
+	}
+	if err := enc.Encode(Response{OK: true, Result: map[string]any{"subscribed": true}}); err != nil {
+		return
+	}
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		return
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return
+	}
+
+	disconnected := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, conn)
+		close(disconnected)
+	}()
+	streamEnc := json.NewEncoder(conn)
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			if err := conn.SetWriteDeadline(time.Now().Add(rpcWriteTimeout)); err != nil {
+				return
+			}
+			if err := streamEnc.Encode(StreamEvent{Type: "request", Event: event}); err != nil {
+				return
+			}
+			if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+				return
+			}
+		case <-disconnected:
+			return
+		case <-s.ctx.Done():
 			return
 		}
 	}

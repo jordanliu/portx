@@ -50,14 +50,24 @@ func runCleanup(ctx context.Context, cmd *cli.Command) error {
 	if !daemonRunning {
 		if _, err := os.Stat(pidPath); err == nil {
 			record, readErr := readPID(pidPath)
-			if readErr != nil {
-				return apperr.New(apperr.ExitCleanupWarning, "refusing cleanup: invalid daemon pid file")
-			}
-			if procutil.Alive(record.PID) {
-				if identityErr := validateProcess(record, "portxd"); identityErr != nil {
-					return apperr.New(apperr.ExitCleanupWarning, identityErr.Error())
+			if readErr == nil {
+				if procutil.Alive(record.PID) {
+					if identityErr := validateProcess(record, "portxd"); identityErr != nil {
+						return apperr.New(apperr.ExitCleanupWarning, identityErr.Error())
+					}
+					daemonRunning = true
 				}
-				daemonRunning = true
+			} else {
+				legacyPID, legacyErr := readLegacyPID(pidPath)
+				if legacyErr != nil {
+					return apperr.New(apperr.ExitCleanupWarning, "refusing cleanup: invalid daemon pid file")
+				}
+				if procutil.Alive(legacyPID) {
+					if identityErr := validateLegacyProcess(legacyPID, "portxd"); identityErr != nil {
+						return apperr.New(apperr.ExitCleanupWarning, identityErr.Error())
+					}
+					daemonRunning = true
+				}
 			}
 		}
 	}
@@ -137,39 +147,65 @@ func stopDaemon(pidFile string) error {
 
 func stopProcessFile(pidFile, kind string, opts stopOptions) error {
 	record, err := readPID(pidFile)
-	if err != nil {
+	if err == nil {
+		return stopProcessRecord(record, kind, opts)
+	}
+	legacyPID, legacyErr := readLegacyPID(pidFile)
+	if legacyErr != nil {
 		return err
 	}
+	return stopLegacyProcess(legacyPID, kind, opts)
+}
+
+func stopProcessRecord(record processRecord, kind string, opts stopOptions) error {
 	if !procutil.Alive(record.PID) {
 		return nil
 	}
 	if err := validateProcess(record, kind); err != nil {
 		return err
 	}
-	if !procutil.Alive(record.PID) {
+	return stopProcess(record.PID, opts, func() error {
+		return validateProcess(record, kind)
+	})
+}
+
+func stopLegacyProcess(pid int, kind string, opts stopOptions) error {
+	if !procutil.Alive(pid) {
 		return nil
 	}
-	if err := procutil.Interrupt(record.PID); err != nil && procutil.Alive(record.PID) {
+	if err := validateLegacyProcess(pid, kind); err != nil {
+		return err
+	}
+	return stopProcess(pid, opts, func() error {
+		return validateLegacyProcess(pid, kind)
+	})
+}
+
+func stopProcess(pid int, opts stopOptions, validate func() error) error {
+	if !procutil.Alive(pid) {
+		return nil
+	}
+	if err := procutil.Interrupt(pid); err != nil && procutil.Alive(pid) {
 		return err
 	}
 	deadline := time.Now().Add(opts.interruptTimeout)
-	for procutil.Alive(record.PID) && time.Now().Before(deadline) {
+	for procutil.Alive(pid) && time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
 	}
-	if !procutil.Alive(record.PID) {
+	if !procutil.Alive(pid) {
 		return nil
 	}
-	if err := validateProcess(record, kind); err != nil {
+	if err := validate(); err != nil {
 		return fmt.Errorf("refusing forced termination: %w", err)
 	}
-	if err := procutil.Kill(record.PID); err != nil && procutil.Alive(record.PID) {
+	if err := procutil.Kill(pid); err != nil && procutil.Alive(pid) {
 		return err
 	}
 	deadline = time.Now().Add(opts.killTimeout)
-	for procutil.Alive(record.PID) && time.Now().Before(deadline) {
+	for procutil.Alive(pid) && time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
 	}
-	if procutil.Alive(record.PID) {
+	if procutil.Alive(pid) {
 		return apperr.New(apperr.ExitCleanupWarning, fmt.Sprintf("%s did not exit", opts.processName))
 	}
 	return nil
@@ -190,16 +226,21 @@ func readPID(pidFile string) (processRecord, error) {
 	return record, nil
 }
 
+func readLegacyPID(pidFile string) (int, error) {
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return 0, apperr.New(apperr.ExitCleanupWarning, "unverified process pid file")
+	}
+	return pid, nil
+}
+
 func validateProcess(record processRecord, kind string) error {
 	if record.Kind != kind {
 		return fmt.Errorf("pid file identifies %s, expected %s", record.Kind, kind)
-	}
-	requiredArguments, ok := map[string][]string{
-		"portxd":      []string{"daemon", "run"},
-		"cloudflared": []string{"tunnel", "run"},
-	}[kind]
-	if !ok {
-		return fmt.Errorf("unknown process kind %q", kind)
 	}
 	name, command, startTime, err := inspectProcess(record.PID)
 	if err != nil {
@@ -213,12 +254,50 @@ func validateProcess(record processRecord, kind string) error {
 	if startTime != record.StartTime {
 		return fmt.Errorf("pid %d start time does not match pid record", record.PID)
 	}
+	requiredArguments, ok := requiredProcessArguments(kind)
+	if !ok {
+		return fmt.Errorf("unknown process kind %q", kind)
+	}
 	for _, argument := range requiredArguments {
 		if !commandHasArgument(command, argument) {
 			return fmt.Errorf("pid %d command does not identify %s", record.PID, kind)
 		}
 	}
 	return nil
+}
+
+func validateLegacyProcess(pid int, kind string) error {
+	name, command, _, err := inspectProcess(pid)
+	if err != nil {
+		return fmt.Errorf("legacy %s pid file points to PID %d, but the process could not be verified: %w", kind, pid, err)
+	}
+	actualName := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
+	actualName = strings.TrimSuffix(actualName, ".exe")
+	if kind == "portxd" {
+		if actualName != "portx" && actualName != "portxd" {
+			return fmt.Errorf("legacy daemon pid file points to PID %d process %q, not PortX", pid, actualName)
+		}
+	} else if actualName != kind {
+		return fmt.Errorf("legacy %s pid file points to PID %d process %q, not %s", kind, pid, actualName, kind)
+	}
+	requiredArguments, ok := requiredProcessArguments(kind)
+	if !ok {
+		return fmt.Errorf("unknown process kind %q", kind)
+	}
+	for _, argument := range requiredArguments {
+		if !commandHasArgument(command, argument) {
+			return fmt.Errorf("legacy %s pid file points to PID %d without the expected %s command", kind, pid, kind)
+		}
+	}
+	return nil
+}
+
+func requiredProcessArguments(kind string) ([]string, bool) {
+	requiredArguments, ok := map[string][]string{
+		"portxd":      []string{"daemon", "run"},
+		"cloudflared": []string{"tunnel", "run"},
+	}[kind]
+	return requiredArguments, ok
 }
 
 func inspectProcess(pid int) (name, command string, startTime int64, err error) {

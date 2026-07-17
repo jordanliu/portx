@@ -21,6 +21,13 @@ func TestReadPIDRequiresProcessIdentity(t *testing.T) {
 	if _, err := readPID(legacyPath); err == nil {
 		t.Fatal("readPID accepted a legacy PID-only file")
 	}
+	legacyPID, err := readLegacyPID(legacyPath)
+	if err != nil {
+		t.Fatalf("readLegacyPID rejected a valid legacy PID: %v", err)
+	}
+	if legacyPID != 1234 {
+		t.Fatalf("readLegacyPID returned %d, want 1234", legacyPID)
+	}
 
 	validPath := filepath.Join(dir, "process.pid")
 	data := []byte(`{"pid":1234,"executable":"/usr/local/bin/portx","kind":"portxd","start_time":123456789}`)
@@ -34,6 +41,14 @@ func TestReadPIDRequiresProcessIdentity(t *testing.T) {
 	if record.PID != 1234 || record.Executable != "/usr/local/bin/portx" ||
 		record.Kind != "portxd" || record.StartTime != 123456789 {
 		t.Fatalf("unexpected process record: %+v", record)
+	}
+}
+
+func TestValidateLegacyProcessRejectsUnrelatedProcess(t *testing.T) {
+	t.Parallel()
+
+	if err := validateLegacyProcess(os.Getpid(), "cloudflared"); err == nil {
+		t.Fatal("validateLegacyProcess accepted the test process as cloudflared")
 	}
 }
 

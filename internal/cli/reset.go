@@ -197,6 +197,9 @@ func coordinateRuntime(releaseLeases bool) error {
 		}); err != nil {
 			return fmt.Errorf("stop cloudflared: %w", err)
 		}
+		if err := os.Remove(cloudflaredPID); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove cloudflared pid file: %w", err)
+		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect cloudflared pid file: %w", err)
 	}

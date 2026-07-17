@@ -35,15 +35,16 @@ type DNSRecord struct {
 }
 
 const (
-	PhaseNone          = "none"
-	PhaseAuthenticated = "authenticated"
-	PhaseSelected      = "resources_selected"
-	PhaseTunnelEnsured = "tunnel_ensured"
-	PhaseTokenStored   = "token_stored"
-	PhaseConfigApplied = "config_applied"
-	PhaseDNSEnsured    = "dns_ensured"
-	PhaseVerified      = "verified"
-	PhaseReady         = "ready"
+	PhaseNone                = "none"
+	PhaseAuthenticated       = "authenticated"
+	PhaseSelected            = "resources_selected"
+	PhaseTunnelEnsured       = "tunnel_ensured"
+	PhaseTokenStored         = "token_stored"
+	PhaseConfigApplied       = "config_applied"
+	PhaseDNSEnsured          = "dns_ensured"
+	PhaseVerificationPending = "verification_pending"
+	PhaseVerified            = "verified"
+	PhaseReady               = "ready"
 )
 
 func Open() (*Store, error) {

@@ -15,13 +15,17 @@ import (
 	"portx/internal/config"
 	"portx/internal/credentials"
 	"portx/internal/rpc"
+	"portx/internal/state"
 	"portx/internal/ui"
 )
 
 func doctorCommand() *cli.Command {
 	return &cli.Command{
-		Name:   "doctor",
-		Usage:  "Diagnose common PortX problems",
+		Name:  "doctor",
+		Usage: "Diagnose common PortX problems",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "verify", Usage: "retry public hostname verification"},
+		},
 		Action: runDoctor,
 	}
 }
@@ -64,6 +68,10 @@ func runDoctor(ctx context.Context, cmd *cli.Command) error {
 	cfg, ok := checkConfig(&r)
 	if ok {
 		checkProfile(ctx, &r, cmd, cfg)
+		checkSetupPhase(&r)
+		if cmd.Bool("verify") {
+			verifyProfile(ctx, &r, cmd, cfg)
+		}
 	}
 	checkProject(&r)
 	checkDaemon(&r, runtimeDir)
@@ -73,6 +81,58 @@ func runDoctor(ctx context.Context, cmd *cli.Command) error {
 		return ui.ShownError{Err: fmt.Errorf("doctor found issues")}
 	}
 	return nil
+}
+
+func checkSetupPhase(r *doctorReport) {
+	st, err := state.Open()
+	if err != nil {
+		return
+	}
+	if st.Data().Phase == state.PhaseVerificationPending {
+		r.warn("public hostname verification not completed (use --verify to run it)")
+	}
+}
+
+func verifyProfile(ctx context.Context, r *doctorReport, cmd *cli.Command, cfg config.Config) {
+	profileName := config.ResolveProfile(cmd.String("profile"), "", cfg.DefaultProfile)
+	prof, err := cfg.Profile(profileName)
+	if err != nil {
+		r.check("public hostname verification", err)
+		return
+	}
+	store, err := credentials.Open()
+	if !r.check("credential store for verification", err) {
+		return
+	}
+	tunnelToken, err := store.Get(credentials.TunnelTokenKey(profileName))
+	if !r.check("tunnel token for verification", err) {
+		return
+	}
+	if err := coordinateRuntime(false); err != nil {
+		r.warn("public verification skipped: %v", err)
+		return
+	}
+	if err := verifySetup(ctx, cfg, tunnelToken, prof.Wildcard); err != nil {
+		if isVerificationPending(err) {
+			r.warn("public hostname verification pending DNS propagation")
+			return
+		}
+		r.check("public hostname verification", err)
+		return
+	}
+	st, err := state.Open()
+	if !r.check("setup state", err) {
+		return
+	}
+	if err := st.SetPhase(state.PhaseVerified); err != nil {
+		r.check("save verified setup state", err)
+		return
+	}
+	if err := st.SetPhase(state.PhaseReady); err != nil {
+		r.check("save ready setup state", err)
+		return
+	}
+	r.ok("public hostname verification")
 }
 
 func checkCloudflared(r *doctorReport) {

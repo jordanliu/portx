@@ -31,9 +31,34 @@ func setupCommand() *cli.Command {
 		Usage: "One-time Cloudflare account, tunnel, and wildcard DNS setup",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "token", Usage: "use pasted API token instead of browser login"},
+			&cli.BoolFlag{Name: "reauth", Usage: "force a fresh browser login before setup"},
 		},
 		Action: runSetup,
 	}
+}
+
+type setupAuthResult struct {
+	token         string
+	preferAccount string
+	preferZone    string
+	browser       bool
+}
+
+type verificationPendingError struct {
+	err error
+}
+
+func (e *verificationPendingError) Error() string {
+	return fmt.Sprintf("DNS propagation pending: %v", e.err)
+}
+
+func (e *verificationPendingError) Unwrap() error {
+	return e.err
+}
+
+func isVerificationPending(err error) bool {
+	var pending *verificationPendingError
+	return errors.As(err, &pending)
 }
 
 func runSetup(ctx context.Context, cmd *cli.Command) (err error) {
@@ -43,15 +68,21 @@ func runSetup(ctx context.Context, cmd *cli.Command) (err error) {
 	}
 	originalCfg := cloneConfig(cfg0)
 	profileName := config.ResolveProfile(cmd.String("profile"), "", cfg0.DefaultProfile)
-	token, preferAccount, preferZone, err := authenticateSetup(ctx, cmd)
+	authResult, err := authenticateSetup(ctx, cmd)
 	if err != nil {
 		return err
 	}
 
-	cf := cloudflare.New(token)
-	if err := cf.VerifyToken(ctx); err != nil {
+	authResult, cf, err := verifySetupAuth(ctx, authResult)
+	if err != nil {
 		return err
 	}
+	if authResult.browser {
+		ui.Success("Browser authentication verified")
+	}
+	token := authResult.token
+	preferAccount := authResult.preferAccount
+	preferZone := authResult.preferZone
 	if err := coordinateRuntime(false); err != nil {
 		return fmt.Errorf("stop active PortX routes before setup: %w", err)
 	}
@@ -166,7 +197,7 @@ func runSetup(ctx context.Context, cmd *cli.Command) (err error) {
 	status := ui.StartStatus("Ensuring Cloudflare tunnel")
 	cfg := cloneConfig(originalCfg)
 
-	tunnel, tunnelTokenValue, created, previousConfig, err := ensureTunnel(ctx, ensureTunnelOpts{
+	tunnel, _, created, previousConfig, err := ensureTunnel(ctx, ensureTunnelOpts{
 		cf:          cf,
 		store:       store,
 		status:      status,
@@ -223,39 +254,21 @@ func runSetup(ctx context.Context, cmd *cli.Command) (err error) {
 	}); err != nil {
 		return fmt.Errorf("save setup state: %w", err)
 	}
-	status.Set("Verifying end-to-end")
-	if err := verifySetup(ctx, cfg, tunnelTokenValue, ns); err != nil {
-		status.Stop()
-		rollback.keepResources = true
-		ui.Warn("setup verification is pending: %v", err)
-		ui.Dim("   Resources are provisioned, but setup is not verified yet:")
-		ui.Dim("   portx doctor")
-		ui.Dim("   portx http --url=test.%s 3000", strings.TrimPrefix(ns, "*."))
-		return apperr.Wrap(
-			apperr.ExitProvision,
-			"setup provisioned resources but end-to-end verification failed",
-			err,
-		)
-	} else {
-		status.Stop()
-		if err := st.SetPhase(state.PhaseVerified); err != nil {
-			return fmt.Errorf("save setup state: %w", err)
+	status.Stop()
+	if err := st.SetPhase(state.PhaseVerificationPending); err != nil {
+		return fmt.Errorf("save setup state: %w", err)
+	}
+	if previousState.WildcardDNS != nil &&
+		previousState.WildcardDNS.OwnedByPortx &&
+		previousState.WildcardDNS.RecordID != "" &&
+		previousState.WildcardDNS.RecordID != dnsID {
+		if err := cf.DeleteDNS(ctx, zone.ID, previousState.WildcardDNS.RecordID); err != nil {
+			return fmt.Errorf("remove previous PortX-managed DNS record: %w", err)
 		}
-		if err := st.SetPhase(state.PhaseReady); err != nil {
-			return fmt.Errorf("save setup state: %w", err)
-		}
-		if previousState.WildcardDNS != nil &&
-			previousState.WildcardDNS.OwnedByPortx &&
-			previousState.WildcardDNS.RecordID != "" &&
-			previousState.WildcardDNS.RecordID != dnsID {
-			if err := cf.DeleteDNS(ctx, zone.ID, previousState.WildcardDNS.RecordID); err != nil {
-				return fmt.Errorf("remove previous PortX-managed DNS record: %w", err)
-			}
-			ui.Success("removed previous wildcard DNS")
-		}
+		ui.Success("removed previous wildcard DNS")
 	}
 
-	ui.PrintSetupReady(ns, tunnel.Name)
+	ui.PrintSetupProvisioned(ns, tunnel.Name)
 	return nil
 }
 
@@ -695,6 +708,30 @@ func saveSetupProfile(
 }
 
 func verifySetup(ctx context.Context, cfg config.Config, tunnelToken, wildcard string) (err error) {
+	return verifySetupWithOptions(verificationOptions{
+		ctx:         ctx,
+		cfg:         cfg,
+		tunnelToken: tunnelToken,
+		wildcard:    wildcard,
+	})
+}
+
+type verificationOptions struct {
+	ctx         context.Context
+	cfg         config.Config
+	tunnelToken string
+	wildcard    string
+	progress    func(string)
+}
+
+func (o verificationOptions) setProgress(message string) {
+	if o.progress != nil {
+		o.progress(message)
+	}
+}
+
+func verifySetupWithOptions(o verificationOptions) (err error) {
+	o.setProgress("Verifying end-to-end (starting tunnel)")
 	st, err := cloudflared.EnsureInstalled()
 	if err != nil {
 		return err
@@ -702,12 +739,12 @@ func verifySetup(ctx context.Context, cfg config.Config, tunnelToken, wildcard s
 	bin := st.Path
 	nonce := uuid.NewString()
 	label := "portx-setup-" + uuid.NewString()[:8]
-	host := label + strings.TrimPrefix(wildcard, "*")
+	host := label + strings.TrimPrefix(o.wildcard, "*")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(nonce))
 	})
-	proxyPort := cfg.Defaults.ProxyPort
+	proxyPort := o.cfg.Defaults.ProxyPort
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -723,8 +760,8 @@ func verifySetup(ctx context.Context, cfg config.Config, tunnelToken, wildcard s
 
 	runtimeDir, _ := config.RuntimeDir()
 	_ = config.EnsureDir(runtimeDir)
-	proc, err := cloudflared.StartNamed(ctx, bin, cloudflared.NamedOptions{
-		Token:   tunnelToken,
+	proc, err := cloudflared.StartNamed(o.ctx, bin, cloudflared.NamedOptions{
+		Token:   o.tunnelToken,
 		LogPath: filepath.Join(runtimeDir, "setup-cloudflared.log"),
 	})
 	if err != nil {
@@ -735,8 +772,9 @@ func verifySetup(ctx context.Context, cfg config.Config, tunnelToken, wildcard s
 			err = fmt.Errorf("stop setup cloudflared: %w", stopErr)
 		}
 	}()
-	rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	rctx, cancel := context.WithTimeout(o.ctx, 2*time.Minute)
 	defer cancel()
+	o.setProgress("Verifying end-to-end (waiting for tunnel readiness)")
 	if err := proc.WaitReady(rctx); err != nil {
 		return err
 	}
@@ -744,36 +782,107 @@ func verifySetup(ctx context.Context, cfg config.Config, tunnelToken, wildcard s
 	// public probe
 	client := &http.Client{Timeout: 15 * time.Second}
 	var last error
-	for i := 0; i < 10; i++ {
+	for attempt := 0; ; attempt++ {
+		o.setProgress(fmt.Sprintf(
+			"Verifying end-to-end (public DNS attempt %d/%d)",
+			attempt+1,
+			verificationAttemptCount(),
+		))
 		req, _ := http.NewRequestWithContext(rctx, http.MethodGet, "https://"+host, nil)
 		resp, err := client.Do(req)
 		if err != nil {
 			last = err
-			time.Sleep(2 * time.Second)
-			continue
+		} else {
+			body := make([]byte, 64)
+			n, _ := resp.Body.Read(body)
+			_ = resp.Body.Close()
+			if string(body[:n]) == nonce {
+				return nil
+			}
+			last = fmt.Errorf("unexpected body")
 		}
-		body := make([]byte, 64)
-		n, _ := resp.Body.Read(body)
-		_ = resp.Body.Close()
-		if string(body[:n]) == nonce {
-			return nil
+		delay, ok := verificationRetryDelay(attempt)
+		if !ok {
+			if isDNSPropagationError(last) {
+				return &verificationPendingError{err: last}
+			}
+			return last
 		}
-		last = fmt.Errorf("unexpected body")
-		time.Sleep(2 * time.Second)
+		o.setProgress(fmt.Sprintf(
+			"Verifying end-to-end (retrying in %s)",
+			delay,
+		))
+		if err := sleepWithContext(rctx, delay); err != nil {
+			if isDNSPropagationError(last) {
+				return &verificationPendingError{err: last}
+			}
+			return err
+		}
 	}
-	return last
 }
 
-func authenticateSetup(ctx context.Context, cmd *cli.Command) (token, preferAccount, preferZone string, err error) {
+func verificationAttemptCount() int {
+	count := 0
+	for {
+		if _, ok := verificationRetryDelay(count); !ok {
+			return count + 1
+		}
+		count++
+	}
+}
+
+func isDNSPropagationError(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && (dnsErr.IsNotFound || dnsErr.IsTemporary)
+}
+
+func verificationRetryDelay(attempt int) (time.Duration, bool) {
+	delays := []time.Duration{
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		30 * time.Second,
+		30 * time.Second,
+	}
+	if attempt >= len(delays) {
+		return 0, false
+	}
+	return delays[attempt], true
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func authenticateSetup(ctx context.Context, cmd *cli.Command) (setupAuthResult, error) {
+	if cmd.Bool("reauth") {
+		if cmd.Bool("token") || strings.TrimSpace(os.Getenv("CLOUDFLARE_API_TOKEN")) != "" {
+			return setupAuthResult{}, apperr.New(
+				apperr.ExitInvalidArgs,
+				"--reauth cannot be combined with API token authentication",
+			)
+		}
+		return authenticateBrowser(ctx, true)
+	}
+
 	// Prefer env over interactive paste for non-interactive use (never argv).
 	if t := strings.TrimSpace(os.Getenv("CLOUDFLARE_API_TOKEN")); t != "" {
 		useEnvToken := cmd.Bool("token") || !isTerminalStdin()
 		if useEnvToken {
-			return t, "", "", nil
+			return setupAuthResult{token: t}, nil
 		}
 	}
 	if cmd.Bool("token") {
-		return promptAPIToken()
+		token, _, _, err := promptAPIToken()
+		return setupAuthResult{token: token}, err
 	}
 
 	_, choice, err := ui.Select("How do you want to authenticate?", []ui.Choice{
@@ -781,21 +890,34 @@ func authenticateSetup(ctx context.Context, cmd *cli.Command) (token, preferAcco
 		{Label: "API token", Desc: "paste a token from the dashboard", Value: "token"},
 	})
 	if err != nil {
-		return "", "", "", apperr.New(apperr.ExitInvalidArgs, "setup cancelled")
+		return setupAuthResult{}, apperr.New(apperr.ExitInvalidArgs, "setup cancelled")
 	}
 
 	if choice.Value == "token" {
-		return promptAPIToken()
+		token, _, _, err := promptAPIToken()
+		return setupAuthResult{token: token}, err
 	}
 
-	// Default: browser OAuth-style login via cloudflared tunnel login
+	return authenticateBrowser(ctx, false)
+}
+
+func authenticateBrowser(ctx context.Context, force bool) (setupAuthResult, error) {
 	if _, err := cloudflared.Lookup(); err != nil {
-		return "", "", "", apperr.New(apperr.ExitCloudflared, fmt.Sprintf(
+		return setupAuthResult{}, apperr.New(apperr.ExitCloudflared, fmt.Sprintf(
 			"Browser login needs cloudflared on your PATH.\n\n"+
 				"  %s\n\n"+
 				"Then re-run:  portx setup\n\n"+
 				"Or choose API token and paste one.",
 			cloudflared.InstallCommand()))
+	}
+	if force {
+		if err := auth.RemoveBrowserCredentials(); err != nil {
+			return setupAuthResult{}, apperr.Wrap(
+				apperr.ExitAuth,
+				"remove stale browser credentials",
+				err,
+			)
+		}
 	}
 	ui.Blank()
 	ui.Info("Opening Cloudflare in your browser…")
@@ -803,10 +925,58 @@ func authenticateSetup(ctx context.Context, cmd *cli.Command) (token, preferAcco
 	defer cancel()
 	res, err := auth.BrowserLogin(loginCtx)
 	if err != nil {
-		return "", "", "", err
+		return setupAuthResult{}, err
 	}
-	ui.Success("Signed in with browser")
-	return res.APIToken, res.AccountID, res.ZoneID, nil
+	return setupAuthResult{
+		token:         res.APIToken,
+		preferAccount: res.AccountID,
+		preferZone:    res.ZoneID,
+		browser:       true,
+	}, nil
+}
+
+func verifySetupAuth(
+	ctx context.Context,
+	authResult setupAuthResult,
+) (setupAuthResult, *cloudflare.Client, error) {
+	cf := cloudflare.New(authResult.token)
+	verifyErr := cf.VerifyToken(ctx)
+	if verifyErr == nil {
+		return authResult, cf, nil
+	}
+	if !authResult.browser || apperr.ExitCode(verifyErr) != apperr.ExitAuth {
+		return setupAuthResult{}, nil, verifyErr
+	}
+	if !isTerminalStdin() {
+		return setupAuthResult{}, nil, browserAuthRecoveryError(verifyErr)
+	}
+
+	ui.Warn("cached Cloudflare browser credentials are invalid or revoked")
+	retry, err := ui.Confirm("Re-authenticate with Cloudflare in your browser?", true)
+	if err != nil {
+		return setupAuthResult{}, nil, apperr.Wrap(apperr.ExitAuth, "confirm browser reauthentication", err)
+	}
+	if !retry {
+		return setupAuthResult{}, nil, browserAuthRecoveryError(verifyErr)
+	}
+
+	fresh, err := authenticateBrowser(ctx, true)
+	if err != nil {
+		return setupAuthResult{}, nil, err
+	}
+	freshClient := cloudflare.New(fresh.token)
+	if err := freshClient.VerifyToken(ctx); err != nil {
+		return setupAuthResult{}, nil, fmt.Errorf("fresh browser authentication failed: %w", err)
+	}
+	return fresh, freshClient, nil
+}
+
+func browserAuthRecoveryError(err error) error {
+	return fmt.Errorf(
+		"cached Cloudflare browser credentials are invalid or revoked: %w\n\n"+
+			"Run:\n  portx login --force\n  portx setup",
+		err,
+	)
 }
 
 func promptAPIToken() (token, preferAccount, preferZone string, err error) {

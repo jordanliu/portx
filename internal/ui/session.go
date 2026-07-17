@@ -345,3 +345,18 @@ func PrintSetupReady(domain, tunnel string) {
 	body.WriteString(HintStyle.Render(fmt.Sprintf("→ https://my-app.%s", suffix)))
 	fmt.Println(BannerStyle.Render(body.String()))
 }
+
+func PrintSetupProvisioned(domain, tunnel string) {
+	suffix := domain
+	if strings.HasPrefix(domain, "*.") {
+		suffix = domain[2:]
+	}
+	var body strings.Builder
+	body.WriteString(SuccessStyle.Render("PortX provisioning complete") + "\n")
+	body.WriteString(RowW(8, "Domain", domain) + "\n")
+	body.WriteString(RowW(8, "Tunnel", tunnel) + "\n")
+	body.WriteString(HintStyle.Render("Try:") + "  ")
+	body.WriteString(CodeStyle.Render("portx http 3000 --url=my-app") + "\n")
+	body.WriteString(HintStyle.Render(fmt.Sprintf("→ https://my-app.%s", suffix)))
+	fmt.Println(BannerStyle.Render(body.String()))
+}

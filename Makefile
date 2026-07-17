@@ -1,4 +1,4 @@
-.PHONY: build test vet format-check workflow-check staticcheck vulncheck check release checksums
+.PHONY: build test vet format-check workflow-check staticcheck vulncheck check release checksums wipe
 
 VERSION ?= 0.0.0-dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -52,3 +52,9 @@ release:
 
 checksums:
 	cd dist && shasum -a 256 portx_* > SHA256SUMS && cat SHA256SUMS
+
+wipe:
+	PORTX_BIN="$(if $(PORTX_BIN),$(PORTX_BIN),./bin/portx)" \
+	PORTX_PROFILES="$(if $(PORTX_PROFILES),$(PORTX_PROFILES),$(if $(PORTX_PROFILE),$(PORTX_PROFILE),personal))" \
+	WIPE_REMOTE="$(if $(WIPE_REMOTE),$(WIPE_REMOTE),0)" \
+	./scripts/wipe.sh

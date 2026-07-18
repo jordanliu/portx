@@ -260,18 +260,14 @@ func (m Session) metadata() string {
 
 	if len(m.Routes) > 0 {
 		for i, route := range m.Routes {
-			label := "Forwarding"
-			if i > 0 {
-				label = ""
-			}
-			forwarding := route.URL
-			if route.Target != "" {
-				forwarding = route.URL + " → " + route.Target
-			}
 			if route.Name != "" {
-				forwarding = CodeStyle.Render(route.Name) + "  " + forwarding
+				lines = append(lines, RowW(12, "Route", route.Name))
 			}
-			lines = append(lines, RowW(12, label, forwarding))
+			forwardingLabel := "Forwarding"
+			if i > 0 {
+				forwardingLabel = ""
+			}
+			lines = append(lines, forwardingRow(forwardingLabel, route))
 		}
 	} else if m.URL != "" {
 		forwarding := m.URL
@@ -311,9 +307,13 @@ func (m Session) compactMetadata(limit int) []string {
 	}
 
 	forwarding := m.forwardingSummary()
+	routeName := m.routeNameSummary()
 	note := compactNote(m.Note)
 	optionalSlots := limit - len(lines)
 	if forwarding != "" {
+		optionalSlots--
+	}
+	if routeName != "" {
 		optionalSlots--
 	}
 	if note != "" {
@@ -329,6 +329,9 @@ func (m Session) compactMetadata(limit int) []string {
 	}
 	if includeMode {
 		lines = append(lines, RowW(12, "Mode", m.Mode))
+	}
+	if routeName != "" && len(lines) < limit {
+		lines = append(lines, routeName)
 	}
 	if forwarding != "" && len(lines) < limit {
 		lines = append(lines, forwarding)
@@ -365,13 +368,17 @@ func (m Session) forwardingSummary() string {
 	return RowW(12, "Forwarding", forwarding)
 }
 
+func (m Session) routeNameSummary() string {
+	if len(m.Routes) != 1 || m.Routes[0].Name == "" {
+		return ""
+	}
+	return RowW(12, "Route", m.Routes[0].Name)
+}
+
 func forwardingRow(label string, route Route) string {
 	forwarding := route.URL
 	if route.Target != "" {
 		forwarding += " → " + route.Target
-	}
-	if route.Name != "" {
-		forwarding = CodeStyle.Render(route.Name) + "  " + forwarding
 	}
 	return RowW(12, label, forwarding)
 }

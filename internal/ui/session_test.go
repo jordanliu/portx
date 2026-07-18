@@ -46,6 +46,33 @@ func TestSessionHeaderOnlyShowsProductName(t *testing.T) {
 	}
 }
 
+func TestSessionSeparatesRouteNameFromForwarding(t *testing.T) {
+	session := NewConnectingSession("Starting…")
+	model, _ := session.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	session = model.(Session)
+	session.Connecting = false
+	session.Status = "online"
+	session.Profile = "personal"
+	session.Mode = "managed"
+	session.Routes = []Route{{
+		Name:   "mcp",
+		URL:    "https://motion-dev.example.com",
+		Target: "http://127.0.0.1:8787",
+	}}
+
+	metadata := session.metadata()
+	if !strings.Contains(metadata, "Route") || !strings.Contains(metadata, "mcp") {
+		t.Fatalf("metadata is missing route name: %q", metadata)
+	}
+	if !strings.Contains(metadata, "Forwarding") || !strings.Contains(metadata, "https://motion-dev.example.com") {
+		t.Fatalf("metadata is missing forwarding: %q", metadata)
+	}
+	forwardingLine := strings.Split(metadata, "\n")[4]
+	if strings.Contains(forwardingLine, "mcp") {
+		t.Fatalf("forwarding line contains route name: %q", forwardingLine)
+	}
+}
+
 func TestSessionReadyLayoutUsesMeasuredTerminalSize(t *testing.T) {
 	session := NewConnectingSession("Starting…")
 	model, _ := session.Update(tea.WindowSizeMsg{Width: 166, Height: 13})

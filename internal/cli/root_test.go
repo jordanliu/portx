@@ -1,6 +1,39 @@
 package cli
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestRootHelpIncludesQuickStart(t *testing.T) {
+	t.Parallel()
+
+	app := newApp()
+	var output bytes.Buffer
+	app.Writer = &output
+	app.ErrWriter = &output
+
+	if err := app.Run(context.Background(), []string{"portx", "--help"}); err != nil {
+		t.Fatalf("run help: %v", err)
+	}
+
+	for _, want := range []string{
+		"Public URLs for local apps, powered by Cloudflare Tunnel",
+		"QUICK START:",
+		"portx http 3000",
+		"portx setup",
+		"portx http 3000 --url=api",
+		"DIAGNOSTICS:",
+		"portx doctor",
+		`Use "portx <command> --help"`,
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("help output missing %q:\n%s", want, output.String())
+		}
+	}
+}
 
 func TestExpandBareURLFlag(t *testing.T) {
 	t.Parallel()

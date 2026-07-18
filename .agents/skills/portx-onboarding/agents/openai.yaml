@@ -1,0 +1,4 @@
+interface:
+  display_name: "PortX Onboarding"
+  short_description: "Set up and run PortX locally"
+  default_prompt: "Use $portx-onboarding to set up PortX, run its checks, or configure a first tunnel."

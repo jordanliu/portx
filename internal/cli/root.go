@@ -15,12 +15,40 @@ import (
 	"portx/internal/ui"
 )
 
+const rootHelpDescription = `QUICK START:
+  portx http 3000              Expose a temporary public URL
+  portx setup                  Configure a stable Cloudflare hostname
+  portx http 3000 --url=api    Start a managed route
+
+DIAGNOSTICS:
+  portx doctor                 Diagnose setup problems
+  portx config show            Show resolved configuration
+  portx cloudflared version    Check cloudflared on PATH
+
+Use "portx <command> --help" for command-specific options.`
+
 func Run(ctx context.Context, args []string) int {
 	args = expandBareURLFlag(args)
-	app := &cli.Command{
-		Name:    "portx",
-		Usage:   "Temporary public development URLs via Cloudflare Tunnel",
-		Version: buildinfo.String(),
+	app := newApp()
+
+	if err := app.Run(ctx, args); err != nil {
+		var shown ui.ShownError
+		if errors.As(err, &shown) {
+			// TUI already rendered the error
+			return apperr.ExitCode(shown.Err)
+		}
+		ui.PrintError(err)
+		return apperr.ExitCode(err)
+	}
+	return apperr.ExitOK
+}
+
+func newApp() *cli.Command {
+	return &cli.Command{
+		Name:        "portx",
+		Usage:       "Public URLs for local apps, powered by Cloudflare Tunnel",
+		Description: rootHelpDescription,
+		Version:     buildinfo.String(),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  "log-level",
@@ -68,17 +96,6 @@ func Run(ctx context.Context, args []string) int {
 			},
 		},
 	}
-
-	if err := app.Run(ctx, args); err != nil {
-		var shown ui.ShownError
-		if errors.As(err, &shown) {
-			// TUI already rendered the error
-			return apperr.ExitCode(shown.Err)
-		}
-		ui.PrintError(err)
-		return apperr.ExitCode(err)
-	}
-	return apperr.ExitOK
 }
 
 // expandBareURLFlag turns `portx http 3000 --url` into `--url=` so managed

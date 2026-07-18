@@ -1,0 +1,4 @@
+interface:
+  display_name: "PortX Reference"
+  short_description: "Explain PortX architecture and code paths"
+  default_prompt: "Use $portx-reference to explain PortX internals or find the right code path for a change."

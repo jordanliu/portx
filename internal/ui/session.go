@@ -474,7 +474,7 @@ func (m *Session) syncRequests() {
 
 	lines := make([]string, 0, len(m.Requests))
 	for _, request := range m.Requests {
-		lines = append(lines, CodeStyle.Render(formatRequestLog(request)))
+		lines = append(lines, CodeStyle.Render(formatRequestLog(request, m.requests.Width)))
 	}
 	m.requests.SetContent(strings.Join(lines, "\n"))
 }
@@ -541,24 +541,54 @@ func SetNote(p *tea.Program, note string) {
 	}
 }
 
-func formatRequestLog(request RequestLog) string {
+const (
+	requestPathMinWidth  = 28
+	requestPathMaxWidth  = 64
+	requestLogFixedWidth = 38
+)
+
+func formatRequestLog(request RequestLog, terminalWidth int) string {
+	pathWidth := requestPathWidth(terminalWidth)
 	return fmt.Sprintf(
-		"%s  %-6s %-28s %3d %7s %8s",
+		"%s  %-6s %-*s %3d %7s %8s",
 		request.Timestamp.Local().Format("15:04:05"),
 		request.Method,
-		truncateRequestPath(request.Path),
+		pathWidth,
+		truncateRequestPath(request.Path, pathWidth),
 		request.Status,
 		formatRequestDuration(request.Duration),
 		formatRequestBytes(request.Bytes),
 	)
 }
 
-func truncateRequestPath(path string) string {
-	const maxPathLength = 28
-	if len(path) <= maxPathLength {
+func requestPathWidth(terminalWidth int) int {
+	width := terminalWidth - requestLogFixedWidth
+	if width < requestPathMinWidth {
+		return requestPathMinWidth
+	}
+	if width > requestPathMaxWidth {
+		return requestPathMaxWidth
+	}
+	return width
+}
+
+func truncateRequestPath(path string, maxWidth int) string {
+	if lipgloss.Width(path) <= maxWidth {
 		return path
 	}
-	return path[:maxPathLength-3] + "..."
+	available := maxWidth - lipgloss.Width("...")
+	if available <= 0 {
+		return strings.Repeat(".", maxWidth)
+	}
+	width := 0
+	for index, character := range path {
+		characterWidth := lipgloss.Width(string(character))
+		if width+characterWidth > available {
+			return path[:index] + "..."
+		}
+		width += characterWidth
+	}
+	return path + "..."
 }
 
 func formatRequestDuration(duration time.Duration) string {

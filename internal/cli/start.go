@@ -45,13 +45,15 @@ type heldRoute struct {
 }
 
 type startOpts struct {
-	ctx         context.Context
-	cmd         *cli.Command
-	pc          config.ProjectConfig
-	cfg         config.Config
-	profileName string
-	prof        config.Profile
-	only        map[string]bool
+	ctx            context.Context
+	cmd            *cli.Command
+	pc             config.ProjectConfig
+	cfg            config.Config
+	profileName    string
+	prof           config.Profile
+	only           map[string]bool
+	originsChecked bool
+	confirmOrigin  originConfirmation
 }
 
 func runStart(ctx context.Context, cmd *cli.Command) error {
@@ -98,6 +100,11 @@ func runStart(ctx context.Context, cmd *cli.Command) error {
 }
 
 func runStartTUI(opts startOpts) error {
+	if err := confirmProjectOrigins(opts); err != nil {
+		return err
+	}
+	opts.originsChecked = true
+
 	var held []heldRoute
 	var client *rpc.Client
 
@@ -154,6 +161,55 @@ func runStartTUI(opts startOpts) error {
 		_ = client.Close()
 	}
 	return err
+}
+
+func confirmProjectOrigins(opts startOpts) error {
+	if opts.cmd != nil && opts.cmd.Bool("no-origin-check") {
+		return nil
+	}
+
+	names := make([]string, 0, len(opts.pc.Routes))
+	for name := range opts.pc.Routes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if len(opts.only) > 0 && !opts.only[name] {
+			continue
+		}
+		target, err := origin.Normalize(opts.pc.Routes[name].Target)
+		if err != nil {
+			return apperr.Wrap(
+				apperr.ExitInvalidArgs,
+				fmt.Sprintf("route %q target", name),
+				err,
+			)
+		}
+		if err := origin.ValidateTargetSafety(target); err != nil {
+			return err
+		}
+		preflightCtx, cancel := context.WithTimeout(opts.ctx, 5*time.Second)
+		err = origin.Preflight(preflightCtx, target)
+		cancel()
+		if err == nil {
+			continue
+		}
+		if opts.confirmOrigin == nil && !ui.IsInteractive() {
+			return err
+		}
+		confirm := opts.confirmOrigin
+		if confirm == nil {
+			confirm = confirmUnavailableOrigin
+		}
+		if err := confirm(
+			target,
+			fmt.Sprintf("Start route %q anyway?", name),
+			err,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runStartJSON(opts startOpts) error {
@@ -251,7 +307,7 @@ func acquireProjectRoute(opts startOpts, client *rpc.Client, name string, route 
 	if err := origin.ValidateTargetSafety(target); err != nil {
 		return heldRoute{}, err
 	}
-	if !opts.cmd.Bool("no-origin-check") {
+	if !opts.cmd.Bool("no-origin-check") && !opts.originsChecked {
 		pctx, cancel := context.WithTimeout(opts.ctx, 5*time.Second)
 		err := origin.Preflight(pctx, target)
 		cancel()

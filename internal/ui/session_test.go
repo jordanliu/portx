@@ -126,6 +126,29 @@ func TestSessionKeepsRequestStreamNoticeVisibleWhenCompacted(t *testing.T) {
 	}
 }
 
+func TestRequestPathWidthUsesAvailableTerminalSpace(t *testing.T) {
+	if got := requestPathWidth(166); got != requestPathMaxWidth {
+		t.Fatalf("wide terminal path width = %d, want %d", got, requestPathMaxWidth)
+	}
+	if got := requestPathWidth(100); got != 62 {
+		t.Fatalf("medium terminal path width = %d, want 62", got)
+	}
+	if got := requestPathWidth(60); got != requestPathMinWidth {
+		t.Fatalf("narrow terminal path width = %d, want %d", got, requestPathMinWidth)
+	}
+}
+
+func TestRequestPathTruncationPreservesUnicode(t *testing.T) {
+	path := strings.Repeat("界", 40)
+	got := truncateRequestPath(path, 28)
+	if lipgloss.Width(got) > 28 {
+		t.Fatalf("truncated path display width = %d, want at most 28", lipgloss.Width(got))
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("truncated path = %q, want ellipsis", got)
+	}
+}
+
 func TestSessionShowsResizeStateWhenTerminalIsTooShort(t *testing.T) {
 	session := NewConnectingSession("Starting…")
 	model, _ := session.Update(tea.WindowSizeMsg{Width: 100, Height: 8})

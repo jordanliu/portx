@@ -34,6 +34,8 @@ const (
 	quickReadyTimeout = 30 * time.Second
 )
 
+type originConfirmation func(*url.URL, string, error) error
+
 func httpCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "http",
@@ -89,14 +91,11 @@ func runHTTP(ctx context.Context, cmd *cli.Command) error {
 			if !ui.IsInteractive() || cmd.Bool("json") {
 				return err
 			}
-			ui.Warn("Could not connect to %q", target.String())
-			ui.Dim("   Nothing is listening on this port yet.")
-			ui.Dim("   Requests will work once your local service starts.")
-			ok, promptErr := ui.Confirm("Start the route anyway?", false)
-			if promptErr != nil {
-				return promptErr
-			}
-			if !ok {
+			if err := confirmUnavailableOrigin(
+				target,
+				"Start the route anyway?",
+				err,
+			); err != nil {
 				return err
 			}
 		}
@@ -118,6 +117,24 @@ func runHTTP(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 	return runManagedHTTP(ctx, cmd, target, publicURL)
+}
+
+func confirmUnavailableOrigin(
+	target *url.URL,
+	question string,
+	preflightErr error,
+) error {
+	ui.Warn("Could not connect to %q", target.String())
+	ui.Dim("   Nothing is listening on this port yet.")
+	ui.Dim("   Requests will work once your local service starts.")
+	ok, err := ui.Confirm(question, false)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return preflightErr
+	}
+	return nil
 }
 
 // resolvePublicURL:

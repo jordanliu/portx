@@ -246,7 +246,6 @@ jobs:
         env:
           VERSION: ${{ needs.release.outputs.version }}
           TAG: ${{ needs.release.outputs.tag }}
-          SOURCE_SHA256: ${{ needs.release.outputs.source_sha256 }}
           SOURCE_REPOSITORY: ${{ github.repository }}
         run: |
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$TAG" != "v${VERSION}" ]]; then
@@ -257,16 +256,22 @@ jobs:
             echo "Unexpected source repository: $SOURCE_REPOSITORY" >&2
             exit 1
           fi
-          if [[ ! "$SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Release job did not produce a valid source archive SHA256" >&2
-            exit 1
-          fi
-
-          ARCHIVE_URL="https://github.com/${SOURCE_REPOSITORY}/releases/download/${TAG}/portx-${VERSION}.tar.gz"
+          ASSET_DIR="/tmp/portx-release-assets"
+          mkdir -p "$ASSET_DIR"
+          ASSETS=(
+            "portx_${VERSION}_darwin_amd64"
+            "portx_${VERSION}_darwin_arm64"
+            "portx_${VERSION}_linux_amd64"
+            "portx_${VERSION}_linux_arm64"
+          )
+          RELEASE_BASE="https://github.com/${SOURCE_REPOSITORY}/releases/download/${TAG}"
           curl --fail --location --retry 5 --retry-delay 2 --silent --show-error \
-            "$ARCHIVE_URL" -o /tmp/portx-source.tar.gz
-          printf '%s  %s\n' "$SOURCE_SHA256" /tmp/portx-source.tar.gz | sha256sum -c -
-          tar -tzf /tmp/portx-source.tar.gz | grep -Fxq "portx-${VERSION}/go.mod"
+            "${RELEASE_BASE}/SHA256SUMS" -o "${ASSET_DIR}/SHA256SUMS"
+          for asset in "${ASSETS[@]}"; do
+            curl --fail --location --retry 5 --retry-delay 2 --silent --show-error \
+              "${RELEASE_BASE}/${asset}" -o "${ASSET_DIR}/${asset}"
+          done
+          (cd "$ASSET_DIR" && sha256sum -c SHA256SUMS --ignore-missing)
 
           BRANCH="update-portx-${TAG}"
           git -C tap fetch origin "$BRANCH" 2>/dev/null || true
@@ -281,22 +286,37 @@ jobs:
             exit 1
           fi
 
-          ruby - "$VERSION" "$TAG" "$SOURCE_SHA256" "$SOURCE_REPOSITORY" <<'RUBY'
-          version, tag, sha256, repository = ARGV
+          ruby - "$VERSION" "$TAG" "$SOURCE_REPOSITORY" "$ASSET_DIR/SHA256SUMS" <<'RUBY'
+          version, tag, repository, sums_path = ARGV
           path = "tap/Formula/portx.rb"
           formula = File.read(path)
-          url = "https://github.com/#{repository}/releases/download/#{tag}/portx-#{version}.tar.gz"
-          url_pattern = /^[ \t]+url "([^"]+)"$/
-          sha_pattern = /^[ \t]+sha256 "([^"]+)"$/
+          targets = %w[darwin_amd64 darwin_arm64 linux_amd64 linux_arm64]
+          sums = File.readlines(sums_path).to_h do |line|
+            sha, asset = line.split
+            [asset, sha]
+          end
+          urls = targets.to_h do |target|
+            asset = "portx_#{version}_#{target}"
+            sha = sums.fetch(asset) { abort "Missing checksum for #{asset}" }
+            [target, [asset, sha]]
+          end
 
-          abort "Formula must contain exactly one url line" unless formula.scan(url_pattern).length == 1
-          abort "Formula must contain exactly one sha256 line" unless formula.scan(sha_pattern).length == 1
+          url_pattern = /^[ \t]+url "([^"]*\/portx_[^"]+_(darwin_amd64|darwin_arm64|linux_amd64|linux_arm64))"$/
+          sha_pattern = /^[ \t]+sha256 "[0-9a-f]{64}"$/
+          version_pattern = /^[ \t]+version "[^"]+"$/
+          abort "Formula must contain exactly four binary url lines" unless formula.scan(url_pattern).length == 4
+          abort "Formula must contain exactly four sha256 lines" unless formula.scan(sha_pattern).length == 4
+          abort "Formula must contain exactly one version line" unless formula.scan(version_pattern).length == 1
 
-          formula.sub!(url_pattern, "  url \"#{url}\"")
-          formula.sub!(sha_pattern, "  sha256 \"#{sha256}\"")
-
-          abort "Formula is missing a url line" unless formula.include?(url)
-          abort "Formula is missing a sha256 line" unless formula.include?(sha256)
+          formula.sub!(version_pattern, "  version \"#{version}\"")
+          targets_in_formula = formula.scan(url_pattern).map { |match| match[1] }
+          formula.gsub!(url_pattern) do
+            target = Regexp.last_match(2)
+            asset = urls.fetch(target).first
+            "  url \"https://github.com/#{repository}/releases/download/#{tag}/#{asset}\""
+          end
+          sha_values = targets_in_formula.map { |target| urls.fetch(target).last }
+          formula.gsub!(sha_pattern) { "  sha256 \"#{sha_values.shift}\"" }
 
           File.write(path, formula)
           RUBY
@@ -308,11 +328,12 @@ jobs:
             exit 1
           fi
 
-          EXPECTED_URL="https://github.com/${SOURCE_REPOSITORY}/releases/download/${TAG}/portx-${VERSION}.tar.gz"
-          grep -Fq "url \"${EXPECTED_URL}\"" tap/Formula/portx.rb || {
-            echo "Formula URL does not match the release archive" >&2
-            exit 1
-          }
+          for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+            grep -Fq "portx_${VERSION}_${target}" tap/Formula/portx.rb || {
+              echo "Formula is missing the ${target} release asset" >&2
+              exit 1
+            }
+          done
 
       - name: Create formula PR
         id: tap
@@ -321,14 +342,14 @@ jobs:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           VERSION: ${{ needs.release.outputs.version }}
           TAG: ${{ needs.release.outputs.tag }}
-          SOURCE_SHA256: ${{ needs.release.outputs.source_sha256 }}
         run: |
           BRANCH="update-portx-${TAG}"
-          EXPECTED_URL="https://github.com/jordanliu/portx/releases/download/${TAG}/portx-${VERSION}.tar.gz"
 
           if git diff --quiet -- Formula/portx.rb; then
-            if git show origin/main:Formula/portx.rb | grep -Fq "url \"${EXPECTED_URL}\"" && \
-              git show origin/main:Formula/portx.rb | grep -Fq "sha256 \"${SOURCE_SHA256}\""; then
+            if git show origin/main:Formula/portx.rb | grep -Fq "portx_${VERSION}_darwin_amd64" && \
+              git show origin/main:Formula/portx.rb | grep -Fq "portx_${VERSION}_darwin_arm64" && \
+              git show origin/main:Formula/portx.rb | grep -Fq "portx_${VERSION}_linux_amd64" && \
+              git show origin/main:Formula/portx.rb | grep -Fq "portx_${VERSION}_linux_arm64"; then
               echo "Formula update for ${TAG} is already merged into main"
               echo "tap_status=merged" >> "$GITHUB_OUTPUT"
               echo "pr_url=" >> "$GITHUB_OUTPUT"
@@ -364,7 +385,7 @@ jobs:
             printf '%s\n' \
               "Updates the PortX Homebrew formula to the ${TAG} release." \
               "" \
-              "Source archive SHA256: ${SOURCE_SHA256}" \
+              "Updates the formula to use the prebuilt macOS and Linux release binaries." \
               > /tmp/portx-homebrew-pr-body
 
             gh pr create \
